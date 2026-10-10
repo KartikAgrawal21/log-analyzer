@@ -42,7 +42,7 @@ $bat = Join-Path $out 'build.bat'
 @"
 @echo off
 call "$vcvars" >nul 2>&1
-cl /nologo /std:c++17 /EHsc /W4 /wd4127 /utf-8 $opt $asanFlag /D_CRT_SECURE_NO_WARNINGS /I"$root\include" /I"$root\tests" /Fo"$out\\" /Fe"$out\quick.exe" $srcList
+cl /nologo /std:c++17 /EHsc /W4 /wd4127 /utf-8 $opt $asanFlag /Fd"$out\\" /D_CRT_SECURE_NO_WARNINGS /I"$root\include" /I"$root\tests" /Fo"$out\\" /Fe"$out\quick.exe" $srcList
 "@ | Set-Content $bat -Encoding ascii
 
 $ErrorActionPreference = 'Continue'   # cl writes warnings to stdout; don't let stray stderr abort us

@@ -71,10 +71,14 @@ inline std::string where(const char* file, int line) {
                                      "CHECK(" #cond ") failed"};                        \
     } while (0)
 
+// The operands are COPIED, not bound by reference: with `auto&& x = f().member;` MSVC does
+// not keep the temporary returned by f() alive, so CHECK_EQ(run(...).code, 2) read freed
+// memory (AddressSanitizer: stack-use-after-scope), with or without parentheses. Tests
+// compare cheap values, so a copy is fine; operands must therefore be copyable.
 #define CHECK_EQ(a, b)                                                                  \
     do {                                                                                \
-        auto&& _tk_a = (a);                                                             \
-        auto&& _tk_b = (b);                                                             \
+        const auto _tk_a = (a);                                                         \
+        const auto _tk_b = (b);                                                         \
         if (!(_tk_a == _tk_b))                                                          \
             throw ::testkit::Failure{::testkit::where(__FILE__, __LINE__) +             \
                                      "CHECK_EQ(" #a ", " #b ") failed: " +              \
