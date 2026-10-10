@@ -10,7 +10,7 @@ on a problem every backend team actually has.
 | Week | Milestone | DSA |
 |------|-----------|-----|
 | 1 ✅ | Log generator + parser, k-way merge of per-service logs by timestamp, Top-K error signatures | min-heap, hash map, k-way merge |
-| 2 | Real-time alert rules ("more than N errors in W seconds"), cooldowns | sliding window (deque), per-rule hash map |
+| 2 ✅ | Real-time alert rules ("more than N errors in W seconds"), cooldowns | sliding window (ring buffer), per-rule hash map |
 | 3 | Search: prefix autocomplete, keyword search, multi-keyword queries | trie, KMP, inverted index |
 | 4 | CLI polish, dashboard / HTTP API | — |
 | 5 | Probabilistic structures + benchmarks on 1M logs | Count-Min Sketch, HyperLogLog |
@@ -39,14 +39,54 @@ cmake --build build
 ./build/loganalyzer_tests
 ```
 
+Wall-clock performance assertions are opt-in because timing ratios are flaky on a busy
+machine: set `LOGANALYZER_PERF_TESTS=1` to include them. `tools/quick.ps1 ... -Asan` runs a
+subset under AddressSanitizer.
+
 ## Usage
 
 ```
 loganalyzer generate --out-dir DIR [--count N] [--seed S] [--services a,b,c]
 loganalyzer merge FILE... [--out FILE]
 loganalyzer top-errors FILE... [--k N] [--min-level LEVEL]
+loganalyzer alerts FILE... --rule SPEC [--rule SPEC ...] [--rules-file FILE]
 loganalyzer bench [--count N]
 ```
+
+### Alert rules
+
+A rule fires when at least `threshold` matching entries fall inside a sliding time window
+(the half-open interval `(t - window, t]`). "More than 50 errors in a minute" is `threshold=51,window=60s`.
+
+```
+name=NAME,threshold=N,window=60s[,service=S][,level=ERROR][,cooldown=5m][,per-service=true]
+```
+
+| field | meaning |
+|-------|---------|
+| `service` | only this service counts (default: all services) |
+| `level` | minimum level that counts (default `ERROR`) |
+| `cooldown` | after firing, repeats are suppressed until this much event time has passed; the next alert reports how many were swallowed |
+| `per-service` | `true`: each service gets its own window and cooldown; `false`: one window shared by all services |
+
+```
+$ cat rules.txt
+# error bursts anywhere in the system
+name=error-burst,threshold=12,window=10s,cooldown=2m
+name=payment-errors,service=payment-service,threshold=6,window=10s,cooldown=1m
+name=warn-pileup,level=WARN,threshold=60,window=10s,cooldown=5m,per-service=true
+
+$ loganalyzer alerts logs\*.log --rules-file rules.txt
+2026-10-10T00:00:02.638Z ALERT rule=error-burst service=* count=12 since=2026-10-10T00:00:00.179Z suppressed=0
+2026-10-10T00:00:09.681Z ALERT rule=payment-errors service=payment-service count=6 since=2026-10-10T00:00:00.179Z suppressed=0
+2026-10-10T00:01:10.307Z ALERT rule=payment-errors service=payment-service count=11 since=2026-10-10T00:01:01.611Z suppressed=54
+2026-10-10T00:02:02.798Z ALERT rule=error-burst service=* count=51 since=2026-10-10T00:01:53.800Z suppressed=608
+...
+processed 100000 entries with 3 rules: 26 alerts (0 late events dropped, 0 malformed lines skipped)
+```
+
+The input files are k-way merged first, so rules always see one time-ordered stream
+(100k entries through 3 rules, including loading the files, takes about 165 ms).
 
 ```
 $ loganalyzer generate --out-dir logs --count 20000
@@ -90,6 +130,8 @@ output of every stage is checked for correctness before the numbers are printed)
 | Min-heap | `min_heap.hpp` | array-backed binary heap, hole-based sift |
 | K-way merge | `log_merger.hpp` | heap of small cursors, O(N log k), stable (timestamp, source, position) order, run fast-path |
 | Top-K errors | `top_k_errors.hpp`, `error_signature.hpp` | hash map keyed by (service, signature), bounded size-k heap for O(n log k) selection, single-pass scanner for normalization |
+| Ring buffer | `ring_buffer.hpp` | growable circular buffer (power-of-two capacity, mask indexing), amortized O(1) push/pop, written instead of using `std::deque` |
+| Alert engine | `alert_engine.hpp` | sliding window over a ring buffer (each timestamp enters and leaves once: amortized O(1) per entry), rules indexed by service in a hash map, overflow-safe unsigned time arithmetic |
 | Parser | `log_parser.hpp` | Hinnant days-from-civil calendar math, string_view slicing, block-based stream reading |
 | Generator | `log_generator.hpp` | xoshiro256** PRNG, Zipf-weighted template choice, exact-integer level thresholds |
 
