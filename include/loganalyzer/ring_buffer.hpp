@@ -63,7 +63,7 @@ public:
     /// Removes the oldest element. Throws std::out_of_range when empty.
     void pop_front() {
         if (empty()) throw std::out_of_range("RingBuffer::pop_front on empty buffer");
-        data_[head_] = T();  // release whatever the slot held (matters for T = std::string)
+        data_[head_] = T();  // don't keep a stale value alive in the vacated slot
         head_ = (head_ + 1) & (data_.size() - 1);
         --size_;
     }

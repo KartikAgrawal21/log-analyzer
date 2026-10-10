@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -72,20 +73,35 @@ AlertRule parse_rule_spec(std::string_view spec);
 /// it is ignored by that window and counted in late_events().
 ///
 /// Alerts from one process() call come out in rule insertion order.
+///
+/// Service names are matched exactly (case-sensitive); a rule whose service never appears
+/// simply never fires. Memory: a window holds one timestamp per entry currently inside it
+/// (needed to report count and first_event_ms), and per-service windows are created on first
+/// use and kept for the engine's lifetime, so a stream with an unbounded number of distinct
+/// services grows without bound.
 class AlertEngine {
 public:
-    /// Throws std::invalid_argument on an empty/duplicate/invalid name, threshold == 0,
-    /// window_ms < 1 or cooldown_ms < 0.
+    /// Throws std::invalid_argument on an empty/duplicate/invalid name, a service containing
+    /// whitespace, threshold == 0, window_ms < 1 or cooldown_ms < 0. Strong exception
+    /// guarantee: if it throws (including std::bad_alloc) the engine is unchanged.
     void add_rule(AlertRule rule);
 
     /// Alerts fired by this entry (usually none).
     std::vector<Alert> process(const LogEntry& entry);
 
     std::size_t rule_count() const noexcept { return rules_.size(); }
-    const AlertRule& rule(std::size_t index) const { return rules_.at(index).rule; }
+
+    /// Throws std::out_of_range for a bad index. The reference stays valid for the engine's
+    /// lifetime (rules are never moved), even when more rules are added.
+    const AlertRule& rule(std::size_t index) const { return rules_.at(index)->rule; }
 
     /// (entry, window) pairs skipped because the entry was older than the window's newest entry.
     std::uint64_t late_events() const noexcept { return late_events_; }
+
+    /// Threshold crossings swallowed by a cooldown that no later alert has reported yet (an
+    /// alert reports the ones before it). Non-zero after the last entry means the final burst
+    /// was under-reported by the alerts themselves.
+    std::uint64_t unreported_suppressed() const noexcept;
 
 private:
     struct Window {
@@ -105,7 +121,9 @@ private:
 
     void evaluate(RuleState& state, const LogEntry& entry, std::vector<Alert>& out);
 
-    std::vector<RuleState> rules_;
+    // Heap-allocated so a RuleState (an unordered_map plus ring buffers) is never copied or
+    // moved when rules_ grows, and so references returned by rule() stay valid.
+    std::vector<std::unique_ptr<RuleState>> rules_;
     std::unordered_set<std::string> names_;
     std::unordered_map<std::string, std::vector<std::size_t>> rules_by_service_;  // rule indices, ascending
     std::vector<std::size_t> wildcard_rules_;                                     // rule indices, ascending

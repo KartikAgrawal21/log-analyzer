@@ -390,3 +390,143 @@ TEST(ParseRuleSpec, RejectsBadSpecs) {
         if (!threw) throw testkit::Failure{std::string("expected invalid_argument for '") + bad + "'"};
     }
 }
+
+// ---- added after review -----------------------------------------------------------------
+
+TEST(AlertEngine, ServiceFilterCombinesWithPerServiceWindows) {
+    AlertEngine engine;
+    AlertRule r = rule("r", 2, 1000);
+    r.service = "a";
+    r.per_service = true;
+    engine.add_rule(r);
+    std::vector<Alert> alerts = feed(engine, {ev(0, Level::Error, "a"), ev(1, Level::Error, "b"),
+                                              ev(2, Level::Error, "b"), ev(3, Level::Error, "a")});
+    CHECK_EQ(alerts.size(), std::size_t{1});
+    CHECK_EQ(alerts[0].service, std::string("a"));
+    CHECK_EQ(alerts[0].count, std::uint64_t{2});
+}
+
+TEST(AlertEngine, PerServiceWithZeroCooldownFiresOnEveryEntryOverThreshold) {
+    AlertEngine engine;
+    AlertRule r = rule("r", 1, 1000, 0);
+    r.per_service = true;
+    engine.add_rule(r);
+    CHECK_EQ(feed(engine, {ev(0, Level::Error, "a"), ev(0, Level::Error, "a"), ev(1, Level::Error, "b")}).size(),
+             std::size_t{3});
+}
+
+TEST(AlertEngine, SuppressedCountRestartsAfterEveryAlert) {
+    AlertEngine engine;
+    engine.add_rule(rule("r", 1, 1'000'000, 100));
+    std::vector<Alert> alerts = feed(engine, {ev(0), ev(10), ev(20), ev(100), ev(110), ev(200)});
+    CHECK_EQ(alerts.size(), std::size_t{3});
+    CHECK_EQ(alerts[0].suppressed, std::uint64_t{0});
+    CHECK_EQ(alerts[1].suppressed, std::uint64_t{2});  // 10, 20
+    CHECK_EQ(alerts[2].suppressed, std::uint64_t{1});  // 110 only: the counter was reset at 100
+}
+
+TEST(AlertEngine, UnreportedSuppressedCoversTheTailAfterTheLastAlert) {
+    AlertEngine engine;
+    engine.add_rule(rule("r", 1, 1'000'000, 100));
+    CHECK_EQ(engine.unreported_suppressed(), std::uint64_t{0});
+    feed(engine, {ev(0), ev(1), ev(2)});
+    CHECK_EQ(engine.unreported_suppressed(), std::uint64_t{2});
+    std::vector<Alert> alerts = feed(engine, {ev(100)});
+    CHECK_EQ(alerts.size(), std::size_t{1});
+    CHECK_EQ(alerts[0].suppressed, std::uint64_t{2});
+    CHECK_EQ(engine.unreported_suppressed(), std::uint64_t{0});
+
+    // Summed over rules and over per-service windows.
+    AlertEngine many;
+    AlertRule per = rule("per", 1, 1'000'000, 100);
+    per.per_service = true;
+    many.add_rule(per);
+    many.add_rule(rule("shared", 1, 1'000'000, 100));
+    feed(many, {ev(0, Level::Error, "a"), ev(1, Level::Error, "a"), ev(2, Level::Error, "b"), ev(3, Level::Error, "b")});
+    CHECK_EQ(many.unreported_suppressed(), std::uint64_t{1 + 1 + 3});  // per:a 1, per:b 1, shared 3
+}
+
+TEST(AlertEngine, LateEntriesAreTrackedPerWindow) {
+    AlertEngine engine;
+    AlertRule r = rule("r", 100, 1000);
+    r.per_service = true;
+    engine.add_rule(r);
+    feed(engine, {ev(100, Level::Error, "a"), ev(50, Level::Error, "b")});  // b has its own window: not late
+    CHECK_EQ(engine.late_events(), std::uint64_t{0});
+    feed(engine, {ev(60, Level::Error, "a")});  // older than a's newest (100)
+    CHECK_EQ(engine.late_events(), std::uint64_t{1});
+}
+
+TEST(AlertEngine, RuleReferencesStayValidWhenMoreRulesAreAdded) {
+    AlertEngine engine;
+    engine.add_rule(rule("first", 1, 1000));
+    const AlertRule* first = &engine.rule(0);
+    for (int i = 0; i < 200; ++i) engine.add_rule(rule("r" + std::to_string(i), 1, 1000));
+    CHECK(first == &engine.rule(0));
+    CHECK_EQ(first->name, std::string("first"));
+    CHECK_EQ(engine.rule_count(), std::size_t{201});
+    CHECK_EQ(engine.process(ev(0)).size(), std::size_t{201});
+    CHECK_THROWS(engine.rule(201), std::out_of_range);
+}
+
+TEST(AlertEngine, RejectedRulesLeaveNoTraceInTheEngine) {
+    AlertEngine engine;
+    engine.add_rule(rule("r1", 1, 1000));
+    CHECK_THROWS(engine.add_rule(rule("r1", 5, 5000)), std::invalid_argument);  // duplicate
+    AlertRule bad = rule("bad", 0, 1000);
+    bad.service = "x";
+    CHECK_THROWS(engine.add_rule(bad), std::invalid_argument);                  // threshold 0
+    AlertRule r2 = rule("r2", 1, 1000);
+    r2.service = "x";
+    engine.add_rule(r2);
+    CHECK_EQ(engine.rule_count(), std::size_t{2});
+    std::vector<Alert> alerts = engine.process(ev(0, Level::Error, "x"));
+    CHECK_EQ(alerts.size(), std::size_t{2});
+    CHECK_EQ(alerts[0].rule, std::string("r1"));
+    CHECK_EQ(alerts[1].rule, std::string("r2"));
+}
+
+TEST(AlertEngine, RuleNamesUseASafeCharacterSet) {
+    AlertEngine engine;
+    engine.add_rule(rule("a.b_c-1", 1, 1000));
+    for (const char* bad : {"a=b", "a/b", "a\\b", "a:b", "caf\xC3\xA9", "tab\there", "a;b"}) {
+        CHECK_THROWS(engine.add_rule(rule(bad, 1, 1000)), std::invalid_argument);
+    }
+    CHECK_EQ(engine.rule_count(), std::size_t{1});
+}
+
+TEST(ParseRuleSpec, RejectsAnEmptyServiceValue) {
+    CHECK_THROWS(parse_rule_spec("name=a,threshold=1,window=1s,service="), std::invalid_argument);
+    CHECK_THROWS(parse_rule_spec("name=a,threshold=1,window=1s,service=  "), std::invalid_argument);
+}
+
+TEST(ParseRuleSpec, CooldownZeroInEveryBareSpelling) {
+    for (const char* zero : {"0", "00", "000"}) {
+        const AlertRule r = parse_rule_spec(std::string("name=a,threshold=1,window=1s,cooldown=") + zero);
+        CHECK_EQ(r.cooldown_ms, std::int64_t{0});
+    }
+    CHECK_THROWS(parse_rule_spec("name=a,threshold=1,window=1s,cooldown="), std::invalid_argument);
+    CHECK_THROWS(parse_rule_spec("name=a,threshold=1,window=1s,cooldown=5"), std::invalid_argument);  // unit needed
+}
+
+TEST(ParseRuleSpec, ThresholdAndDurationBoundaries) {
+    const AlertRule big = parse_rule_spec("name=a,threshold=4294967295,window=1ms");
+    CHECK_EQ(big.threshold, std::uint32_t{4294967295u});
+    CHECK_THROWS(parse_rule_spec("name=a,threshold=4294967296,window=1ms"), std::invalid_argument);
+
+    // 106751991167 days (about 292 million years) is the largest whole number of days whose
+    // length in milliseconds still fits in an int64; one more day overflows.
+    CHECK_EQ(parse_duration_ms("106751991167d"), std::int64_t{106751991167LL} * 86'400'000);
+    try {
+        parse_duration_ms("106751991168d");
+        throw testkit::Failure{"expected an overflow error"};
+    } catch (const std::invalid_argument& e) {
+        CHECK(std::string(e.what()).find("too large") != std::string::npos);
+    }
+    try {
+        parse_duration_ms("0s");
+        throw testkit::Failure{"expected a zero error"};
+    } catch (const std::invalid_argument& e) {
+        CHECK(std::string(e.what()).find("greater than zero") != std::string::npos);
+    }
+}

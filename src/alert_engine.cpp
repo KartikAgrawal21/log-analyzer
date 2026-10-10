@@ -94,10 +94,25 @@ std::int64_t parse_duration_impl(std::string_view text, bool allow_zero) {
     else {
         throw std::invalid_argument("duration '" + std::string(text) + "' needs a unit: ms, s, m, h or d");
     }
+    // Parse the number on its own first so the range errors can speak about the whole duration
+    // (the bound in milliseconds would be meaningless next to a value written in minutes).
+    const std::uint64_t value = parse_integer(text.substr(0, i), "duration", 0, std::numeric_limits<std::uint64_t>::max());
     const std::uint64_t limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
-    const std::uint64_t value =
-        parse_integer(text.substr(0, i), "duration", allow_zero ? 0 : 1, limit / multiplier);
+    if (value == 0 && !allow_zero) {
+        throw std::invalid_argument("duration '" + std::string(text) + "' must be greater than zero");
+    }
+    if (value > limit / multiplier) {
+        throw std::invalid_argument("duration '" + std::string(text) + "' is too large");
+    }
     return static_cast<std::int64_t>(value * multiplier);
+}
+
+bool all_zeros(std::string_view s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+        if (c != '0') return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -126,6 +141,11 @@ AlertRule parse_rule_spec(std::string_view spec) {
             rule.name = std::string(value);
             have_name = true;
         } else if (key == "service") {
+            // An empty value would silently widen the rule to every service (a templated spec
+            // whose variable expanded to nothing); omitting the key is how to say "all".
+            if (value.empty()) {
+                throw std::invalid_argument("service must not be empty (omit it to match every service)");
+            }
             rule.service = std::string(value);
         } else if (key == "level") {
             const std::optional<Level> level = level_from_string(value);
@@ -139,7 +159,8 @@ AlertRule parse_rule_spec(std::string_view spec) {
             rule.window_ms = parse_duration_ms(value);
             have_window = true;
         } else if (key == "cooldown") {
-            rule.cooldown_ms = (value == "0") ? 0 : parse_duration_impl(value, true);
+            // A bare zero ("0", "00") means no cooldown; anything else needs a unit ("0ms", "5m").
+            rule.cooldown_ms = all_zeros(value) ? 0 : parse_duration_impl(value, true);
         } else if (key == "per-service") {
             if (value == "true") rule.per_service = true;
             else if (value == "false") rule.per_service = false;
@@ -163,15 +184,36 @@ void AlertEngine::add_rule(AlertRule rule) {
     validate_rule(rule);
     if (names_.count(rule.name) != 0) throw std::invalid_argument("duplicate rule name '" + rule.name + "'");
 
+    // Strong exception guarantee: everything that can throw (allocation) happens before the
+    // first visible change. names_.insert is the last throwing step; the two push_backs after
+    // it run on capacity that was reserved up front, so they cannot throw.
     const std::size_t index = rules_.size();
+    const std::string name = rule.name;
     const std::string service = rule.service;
-    names_.insert(rule.name);
-    rules_.push_back(RuleState{std::move(rule), {}, {}});
-    if (service.empty()) {
-        wildcard_rules_.push_back(index);
-    } else {
-        rules_by_service_[service].push_back(index);
+    auto state = std::make_unique<RuleState>();
+    state->rule = std::move(rule);
+
+    // (An empty index list left behind in rules_by_service_ by a later failure is harmless:
+    // process() treats it exactly like a missing entry.)
+    std::vector<std::size_t>& list = service.empty() ? wildcard_rules_ : rules_by_service_[service];
+    auto ensure_room = [](auto& vec) {
+        if (vec.size() == vec.capacity()) vec.reserve(vec.empty() ? 4 : vec.size() * 2);
+    };
+    ensure_room(rules_);
+    ensure_room(list);
+
+    names_.insert(name);
+    rules_.push_back(std::move(state));
+    list.push_back(index);
+}
+
+std::uint64_t AlertEngine::unreported_suppressed() const noexcept {
+    std::uint64_t total = 0;
+    for (const std::unique_ptr<RuleState>& state : rules_) {
+        total += state->shared.suppressed;
+        for (const auto& entry : state->by_service) total += entry.second.suppressed;
     }
+    return total;
 }
 
 std::vector<Alert> AlertEngine::process(const LogEntry& entry) {
@@ -190,7 +232,7 @@ std::vector<Alert> AlertEngine::process(const LogEntry& entry) {
         } else {
             index = wild[b++];
         }
-        evaluate(rules_[index], entry, alerts);
+        evaluate(*rules_[index], entry, alerts);
     }
     return alerts;
 }
