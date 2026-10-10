@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "loganalyzer/alert_engine.hpp"
 #include "loganalyzer/cli.hpp"
 #include "loganalyzer/log_entry.hpp"
 #include "loganalyzer/log_generator.hpp"
@@ -253,4 +254,77 @@ TEST(Cli, BenchRunsEveryStageAndSelfChecks) {
         CHECK(r.out.find(stage) != std::string::npos);
     }
     CHECK(r.out.find("benchmark: 5000 entries") != std::string::npos);
+}
+
+TEST(Cli, AlertsOutputMatchesTheLibraryEngineLineForLine) {
+    TempDir dir("alerts");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "3000", "--services", "a,b,c"}).code, 0);
+
+    const std::string spec = "name=burst,threshold=5,window=10s,cooldown=30s";
+    Result r = run({"alerts", dir.file("logs/a.log"), dir.file("logs/b.log"), dir.file("logs/c.log"), "--rule", spec});
+    CHECK_EQ(r.code, 0);
+
+    // Expected: the same stream through the same engine, formatted the same way.
+    GeneratorConfig config;
+    config.services = {"a", "b", "c"};
+    LogGenerator gen(config);
+    loganalyzer::AlertEngine engine;
+    engine.add_rule(loganalyzer::parse_rule_spec(spec));
+    std::ostringstream expected;
+    std::size_t alerts = 0;
+    for (const LogEntry& e : loganalyzer::merge_sorted(gen.generate_all(3000))) {
+        for (const loganalyzer::Alert& a : engine.process(e)) {
+            ++alerts;
+            expected << loganalyzer::format_iso8601_utc(a.fired_at_ms) << " ALERT rule=" << a.rule
+                     << " service=" << a.service << " count=" << a.count
+                     << " since=" << loganalyzer::format_iso8601_utc(a.first_event_ms)
+                     << " suppressed=" << a.suppressed << "\n";
+        }
+    }
+    CHECK(alerts > 0);  // 5 errors in 10 s fires on this traffic
+    CHECK_EQ(r.out, expected.str());
+    CHECK(r.err.find("processed 9000 entries with 1 rules: " + std::to_string(alerts) + " alerts") !=
+          std::string::npos);
+}
+
+TEST(Cli, AlertsAcceptsSeveralRulesAndARulesFile) {
+    TempDir dir("alerts_rules");
+    write_text(dir.file("a.log"),
+               "2026-10-10T00:00:00.000Z ERROR svc boom\n"
+               "2026-10-10T00:00:00.100Z ERROR svc boom\n"
+               "2026-10-10T00:00:00.200Z WARN svc careful\n");
+    write_text(dir.file("rules.txt"),
+               "# comment line\n"
+               "\n"
+               "name=warns,threshold=3,window=1s,level=WARN\r\n"
+               "   name=indented,threshold=2,window=1s   \n");
+    Result r = run({"alerts", dir.file("a.log"), "--rule", "name=pair,threshold=2,window=1s", "--rules-file",
+                    dir.file("rules.txt")});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("rule=pair") != std::string::npos);
+    CHECK(r.out.find("rule=indented") != std::string::npos);
+    CHECK(r.out.find("rule=warns") != std::string::npos);  // 2 errors + 1 warn are >= WARN: 3 within 1 s
+    CHECK(r.err.find("with 3 rules: 3 alerts") != std::string::npos);
+}
+
+TEST(Cli, AlertsUsageAndRuntimeErrors) {
+    TempDir dir("alerts_errors");
+    write_text(dir.file("a.log"), "2026-10-10T00:00:00.000Z ERROR svc boom\n");
+    CHECK_EQ(run({"alerts"}).code, 2);                                           // no file
+    CHECK_EQ(run({"alerts", dir.file("a.log")}).code, 2);                        // no rule
+    CHECK_EQ(run({"alerts", dir.file("a.log"), "--rule", "name=x"}).code, 2);    // incomplete rule
+    CHECK_EQ(run({"alerts", dir.file("a.log"), "--rule", "name=x,threshold=0,window=1s"}).code, 2);
+    CHECK_EQ(run({"alerts", dir.file("a.log"), "--rule", "name=x,threshold=1,window=1s", "--rule",
+                  "name=x,threshold=2,window=1s"}).code, 2);                     // duplicate rule name
+    Result bad = run({"alerts", dir.file("a.log"), "--rule", "name=x,threshold=1,window=soon"});
+    CHECK_EQ(bad.code, 2);
+    CHECK(bad.err.find("bad --rule") != std::string::npos);
+
+    write_text(dir.file("rules.txt"), "name=ok,threshold=1,window=1s\nthis is wrong\n");
+    Result file_error = run({"alerts", dir.file("a.log"), "--rules-file", dir.file("rules.txt")});
+    CHECK_EQ(file_error.code, 2);
+    CHECK(file_error.err.find("rules.txt:2:") != std::string::npos);
+
+    CHECK_EQ(run({"alerts", dir.file("missing.log"), "--rule", "name=x,threshold=1,window=1s"}).code, 1);
+    CHECK_EQ(run({"alerts", dir.file("a.log"), "--rules-file", dir.file("nope.txt")}).code, 1);
 }

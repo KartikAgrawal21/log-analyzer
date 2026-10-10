@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "loganalyzer/alert_engine.hpp"
 #include "loganalyzer/level.hpp"
 #include "loganalyzer/log_entry.hpp"
 #include "loganalyzer/log_generator.hpp"
@@ -50,6 +51,11 @@ Usage:
       K-way merge time-sorted log files into one sorted stream (stdout unless --out).
   loganalyzer top-errors FILE... [--k N] [--min-level LEVEL]
       Most frequent error signatures (default: top 10 at level ERROR and above).
+  loganalyzer alerts FILE... --rule SPEC [--rule SPEC ...] [--rules-file FILE]
+      Replay the merged logs through sliding-window alert rules. SPEC is comma-separated key=value:
+        name=NAME,threshold=N,window=60s[,service=S][,level=ERROR][,cooldown=5m][,per-service=true]
+      Fires when >= N matching entries fall inside the window; cooldown suppresses repeats.
+      A rules file holds one SPEC per line ('#' starts a comment).
   loganalyzer bench [--count N]
       Time every stage on N generated entries in total (default 1000000).
   loganalyzer help
@@ -65,12 +71,20 @@ Log line format:
 struct ParsedArgs {
     std::vector<std::string> positional;
     std::map<std::string, std::string> options;
+    std::map<std::string, std::vector<std::string>> repeated;  // options that may be given many times
 
     bool has(const std::string& name) const { return options.count(name) != 0; }
+    const std::vector<std::string>& all(const std::string& name) const {
+        static const std::vector<std::string> kNone;
+        auto it = repeated.find(name);
+        return it == repeated.end() ? kNone : it->second;
+    }
 };
 
-/// "--name value" or "--name=value" for the names in `allowed`; everything else is positional.
-ParsedArgs parse_args(const std::vector<std::string>& args, const std::set<std::string>& allowed) {
+/// "--name value" or "--name=value" for the names in `allowed` or `repeatable`; everything
+/// else is positional. A `repeatable` option may appear any number of times (see all()).
+ParsedArgs parse_args(const std::vector<std::string>& args, const std::set<std::string>& allowed,
+                      const std::set<std::string>& repeatable = {}) {
     ParsedArgs parsed;
     for (std::size_t i = 1; i < args.size(); ++i) {  // args[0] is the command
         const std::string& arg = args[i];
@@ -87,10 +101,15 @@ ParsedArgs parse_args(const std::vector<std::string>& args, const std::set<std::
             value = arg.substr(eq + 1);
             has_value = true;
         }
-        if (allowed.count(name) == 0) throw UsageError("unknown option: " + name);
+        const bool is_repeatable = repeatable.count(name) != 0;
+        if (!is_repeatable && allowed.count(name) == 0) throw UsageError("unknown option: " + name);
         if (!has_value) {
             if (i + 1 >= args.size()) throw UsageError("option " + name + " needs a value");
             value = args[++i];
+        }
+        if (is_repeatable) {
+            parsed.repeated[name].push_back(std::move(value));
+            continue;
         }
         if (parsed.has(name)) throw UsageError("option " + name + " given more than once");
         parsed.options[name] = std::move(value);
@@ -346,6 +365,69 @@ int cmd_top_errors(const std::vector<std::string>& args, std::ostream& out) {
     return kOk;
 }
 
+/// One rule spec per line; blank lines and lines starting with '#' are skipped.
+void load_rules_file(const std::string& path, AlertEngine& engine) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot open rules file: " + path);
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(in, line)) {
+        ++line_number;
+        std::size_t begin = 0, end = line.size();
+        while (begin < end && (line[begin] == ' ' || line[begin] == '\t')) ++begin;
+        while (end > begin && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == '\r')) --end;
+        if (begin == end || line[begin] == '#') continue;
+        try {
+            engine.add_rule(parse_rule_spec(std::string_view(line).substr(begin, end - begin)));
+        } catch (const std::invalid_argument& e) {
+            throw UsageError(path + ":" + std::to_string(line_number) + ": " + e.what());
+        }
+    }
+}
+
+int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    const ParsedArgs parsed = parse_args(args, {"--rules-file"}, {"--rule"});
+    if (parsed.positional.empty()) throw UsageError("alerts needs at least one FILE");
+
+    AlertEngine engine;
+    for (const std::string& spec : parsed.all("--rule")) {
+        try {
+            engine.add_rule(parse_rule_spec(spec));
+        } catch (const std::invalid_argument& e) {
+            throw UsageError("bad --rule '" + spec + "': " + e.what());
+        }
+    }
+    if (parsed.has("--rules-file")) load_rules_file(parsed.options.at("--rules-file"), engine);
+    if (engine.rule_count() == 0) throw UsageError("alerts needs at least one --rule or --rules-file");
+
+    std::size_t malformed = 0;
+    std::vector<std::vector<LogEntry>> sources;
+    sources.reserve(parsed.positional.size());
+    for (const std::string& path : parsed.positional) {
+        sources.push_back(load_file(path, malformed));
+        require_sorted(path, sources.back());
+    }
+
+    // Rules need one globally time-ordered stream, which is exactly what the merge produces.
+    KWayMerger merger(std::move(sources));
+    std::uint64_t entries = 0;
+    std::uint64_t alerts = 0;
+    while (merger.has_next()) {
+        const LogEntry entry = merger.next();
+        ++entries;
+        for (const Alert& a : engine.process(entry)) {
+            ++alerts;
+            out << format_iso8601_utc(a.fired_at_ms) << " ALERT rule=" << a.rule << " service=" << a.service
+                << " count=" << a.count << " since=" << format_iso8601_utc(a.first_event_ms)
+                << " suppressed=" << a.suppressed << "\n";
+        }
+    }
+    err << "processed " << entries << " entries with " << engine.rule_count() << " rules: " << alerts
+        << " alerts (" << engine.late_events() << " late events dropped, " << malformed
+        << " malformed lines skipped)\n";
+    return kOk;
+}
+
 struct BenchRow {
     std::string stage;
     double millis;
@@ -457,6 +539,7 @@ int run_cli(const std::vector<std::string>& args, std::ostream& out, std::ostrea
         if (command == "generate") return cmd_generate(args, out);
         if (command == "merge") return cmd_merge(args, out, err);
         if (command == "top-errors") return cmd_top_errors(args, out);
+        if (command == "alerts") return cmd_alerts(args, out, err);
         if (command == "bench") return cmd_bench(args, out);
         throw UsageError("unknown command: " + command);
     } catch (const UsageError& e) {
