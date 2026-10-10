@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "loganalyzer/level.hpp"
@@ -31,6 +32,33 @@ class TopKErrors {
 public:
     /// Entries with a level below `min_level` are ignored entirely.
     explicit TopKErrors(Level min_level = Level::Error);
+
+    TopKErrors(const TopKErrors&) = default;
+    TopKErrors& operator=(const TopKErrors&) = default;
+
+    // Explicit moves (not defaulted): a defaulted move would leave total_ stale while the
+    // groups are gone, so a moved-from object would report entries it no longer holds.
+    // A moved-from TopKErrors is empty (total() == 0, distinct() == 0) and reusable.
+    TopKErrors(TopKErrors&& other)
+        : min_level_(other.min_level_),
+          total_(std::exchange(other.total_, 0)),
+          groups_(std::move(other.groups_)),
+          index_(std::move(other.index_)) {
+        other.groups_.clear();
+        other.index_.clear();
+    }
+
+    TopKErrors& operator=(TopKErrors&& other) {
+        if (this != &other) {
+            min_level_ = other.min_level_;
+            total_ = std::exchange(other.total_, 0);
+            groups_ = std::move(other.groups_);
+            index_ = std::move(other.index_);
+            other.groups_.clear();
+            other.index_.clear();
+        }
+        return *this;
+    }
 
     void add(const LogEntry& entry);
 

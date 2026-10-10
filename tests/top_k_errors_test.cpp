@@ -548,3 +548,28 @@ TEST(TopKErrors, ManyDistinctGroupsWithSmallK) {
     CHECK_EQ(tk.distinct(), std::size_t{100000});
     check_matches_reference(tk, ref, {1, 3, 10, 100}, "100k groups");
 }
+
+TEST(TopKErrors, MovedFromObjectIsEmptyAndReusable) {
+    TopKErrors a;
+    a.add(err(1, "svc", "boom 1"));
+    a.add(err(2, "svc", "boom 2"));
+    CHECK_EQ(a.total(), std::uint64_t{2});
+
+    TopKErrors b(std::move(a));
+    CHECK_EQ(b.total(), std::uint64_t{2});
+    CHECK_EQ(b.distinct(), std::size_t{1});
+    // Regression: total_ used to stay at 2 while the groups were gone.
+    CHECK_EQ(a.total(), std::uint64_t{0});
+    CHECK_EQ(a.distinct(), std::size_t{0});
+    CHECK(a.top_k(5).empty());
+
+    a.add(err(3, "svc", "fresh 9"));
+    CHECK_EQ(a.total(), std::uint64_t{1});
+    CHECK_EQ(a.distinct(), std::size_t{1});
+
+    TopKErrors c;
+    c = std::move(b);
+    CHECK_EQ(c.total(), std::uint64_t{2});
+    CHECK_EQ(b.total(), std::uint64_t{0});
+    CHECK_EQ(b.distinct(), std::size_t{0});
+}
