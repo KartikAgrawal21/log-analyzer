@@ -27,6 +27,7 @@
 #include "loganalyzer/log_merger.hpp"
 #include "loganalyzer/log_parser.hpp"
 #include "loganalyzer/top_k_errors.hpp"
+#include "loganalyzer/wildcard.hpp"
 
 namespace loganalyzer {
 namespace {
@@ -55,10 +56,12 @@ Usage:
       Replay the merged logs through sliding-window alert rules. SPEC is comma-separated key=value:
         name=NAME,threshold=N,window=60s[,service=S][,level=ERROR][,cooldown=5m][,per-service=true]
       Fires when >= N matching entries fall inside the window; cooldown suppresses repeats.
-      A rules file holds one SPEC per line ('#' starts a comment).
+      A rules file holds one SPEC per line; lines starting with '#' are comments.
   loganalyzer bench [--count N]
       Time every stage on N generated entries in total (default 1000000).
   loganalyzer help
+
+FILE arguments may contain * and ? in the file name (logs/*.log); matches are sorted by name.
 
 Log line format:
   2026-10-10T12:00:00.123Z ERROR payment-service Timeout calling bank gateway after 3000ms
@@ -227,6 +230,43 @@ std::vector<std::string> split_commas(const std::string& text) {
 // Commands
 // ---------------------------------------------------------------------------
 
+/// Neither cmd.exe nor PowerShell expands wildcards for native programs, so the tool does it:
+/// an input such as logs/*.log (wildcards in the file-name part only) becomes the matching
+/// regular files, sorted by name so the merge's tie-breaking order is deterministic. An input
+/// without wildcards, or naming an existing file, is kept as is.
+std::vector<std::string> expand_inputs(const std::vector<std::string>& inputs) {
+    std::vector<std::string> result;
+    for (const std::string& input : inputs) {
+        std::error_code exists_ec;  // non-throwing overload: a '*' in a path is invalid on Windows
+        if (input.find_first_of("*?") == std::string::npos || fs::exists(fs::path(input), exists_ec)) {
+            result.push_back(input);
+            continue;
+        }
+        const fs::path pattern(input);
+        const fs::path dir = pattern.parent_path();
+        if (dir.string().find_first_of("*?") != std::string::npos) {
+            throw UsageError("wildcards are only supported in the file name, not in directories: " + input);
+        }
+        const std::string name_pattern = pattern.filename().string();
+        std::error_code ec;
+        fs::directory_iterator it(dir.empty() ? fs::path(".") : dir, ec);
+        if (ec) throw std::runtime_error("cannot read directory for " + input + ": " + ec.message());
+        std::vector<std::string> matches;
+        for (const fs::directory_entry& entry : it) {
+            std::error_code type_ec;
+            if (!entry.is_regular_file(type_ec)) continue;
+            const std::string name = entry.path().filename().string();
+            if (wildcard_match(name_pattern, name)) {
+                matches.push_back(dir.empty() ? name : (dir / name).string());
+            }
+        }
+        if (matches.empty()) throw std::runtime_error("no files match: " + input);
+        std::sort(matches.begin(), matches.end());
+        result.insert(result.end(), matches.begin(), matches.end());
+    }
+    return result;
+}
+
 int cmd_generate(const std::vector<std::string>& args, std::ostream& out) {
     const ParsedArgs parsed = parse_args(args, {"--out-dir", "--count", "--seed", "--services"});
     reject_positional(parsed, "generate");
@@ -284,11 +324,12 @@ int cmd_generate(const std::vector<std::string>& args, std::ostream& out) {
 int cmd_merge(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
     const ParsedArgs parsed = parse_args(args, {"--out"});
     if (parsed.positional.empty()) throw UsageError("merge needs at least one FILE");
+    const std::vector<std::string> files = expand_inputs(parsed.positional);
 
     std::size_t malformed = 0;
     std::vector<std::vector<LogEntry>> sources;
-    sources.reserve(parsed.positional.size());
-    for (const std::string& path : parsed.positional) {
+    sources.reserve(files.size());
+    for (const std::string& path : files) {
         sources.push_back(load_file(path, malformed));
         require_sorted(path, sources.back());
     }
@@ -311,7 +352,7 @@ int cmd_merge(const std::vector<std::string>& args, std::ostream& out, std::ostr
     sink->flush();
     if (!*sink) throw std::runtime_error("write failed");
 
-    err << "merged " << total << " entries from " << parsed.positional.size() << " files (" << malformed
+    err << "merged " << total << " entries from " << files.size() << " files (" << malformed
         << " malformed skipped)\n";
     return kOk;
 }
@@ -319,6 +360,7 @@ int cmd_merge(const std::vector<std::string>& args, std::ostream& out, std::ostr
 int cmd_top_errors(const std::vector<std::string>& args, std::ostream& out) {
     const ParsedArgs parsed = parse_args(args, {"--k", "--min-level"});
     if (parsed.positional.empty()) throw UsageError("top-errors needs at least one FILE");
+    const std::vector<std::string> files = expand_inputs(parsed.positional);
 
     const std::size_t k = static_cast<std::size_t>(uint_option(parsed, "--k", 10, 1, 1'000'000));
     Level min_level = Level::Error;
@@ -330,7 +372,7 @@ int cmd_top_errors(const std::vector<std::string>& args, std::ostream& out) {
 
     TopKErrors counter(min_level);
     std::size_t malformed = 0;
-    for (const std::string& path : parsed.positional) {
+    for (const std::string& path : files) {
         for (const LogEntry& entry : load_file(path, malformed)) counter.add(entry);
     }
 
@@ -367,12 +409,23 @@ int cmd_top_errors(const std::vector<std::string>& args, std::ostream& out) {
 
 /// One rule spec per line; blank lines and lines starting with '#' are skipped.
 void load_rules_file(const std::string& path, AlertEngine& engine) {
-    std::ifstream in(path);
+    // Binary mode: in text mode MSVC treats a stray 0x1A byte as end-of-file and would silently
+    // drop every rule after it. A trailing '\r' (CRLF files) is stripped below instead.
+    std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open rules file: " + path);
     std::string line;
     std::size_t line_number = 0;
     while (std::getline(in, line)) {
         ++line_number;
+        if (line_number == 1) {
+            // Editors and PowerShell's UTF-8 output start the file with a BOM; UTF-16 (what
+            // '>' redirection writes in Windows PowerShell 5.1) cannot be read byte-wise.
+            if (line.compare(0, 3, "\xEF\xBB\xBF") == 0) {
+                line.erase(0, 3);
+            } else if (line.compare(0, 2, "\xFF\xFE") == 0 || line.compare(0, 2, "\xFE\xFF") == 0) {
+                throw std::runtime_error(path + " is UTF-16 encoded; save the rules file as UTF-8 or ASCII");
+            }
+        }
         std::size_t begin = 0, end = line.size();
         while (begin < end && (line[begin] == ' ' || line[begin] == '\t')) ++begin;
         while (end > begin && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == '\r')) --end;
@@ -388,6 +441,7 @@ void load_rules_file(const std::string& path, AlertEngine& engine) {
 int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
     const ParsedArgs parsed = parse_args(args, {"--rules-file"}, {"--rule"});
     if (parsed.positional.empty()) throw UsageError("alerts needs at least one FILE");
+    const std::vector<std::string> files = expand_inputs(parsed.positional);
 
     AlertEngine engine;
     for (const std::string& spec : parsed.all("--rule")) {
@@ -402,8 +456,8 @@ int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ost
 
     std::size_t malformed = 0;
     std::vector<std::vector<LogEntry>> sources;
-    sources.reserve(parsed.positional.size());
-    for (const std::string& path : parsed.positional) {
+    sources.reserve(files.size());
+    for (const std::string& path : files) {
         sources.push_back(load_file(path, malformed));
         require_sorted(path, sources.back());
     }
@@ -422,9 +476,16 @@ int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ost
                 << " suppressed=" << a.suppressed << "\n";
         }
     }
+    out.flush();
+    if (!out) throw std::runtime_error("write failed");
+
     err << "processed " << entries << " entries with " << engine.rule_count() << " rules: " << alerts
-        << " alerts (" << engine.late_events() << " late events dropped, " << malformed
-        << " malformed lines skipped)\n";
+        << " alerts (" << malformed << " malformed lines skipped";
+    // Crossings swallowed by a cooldown after the last alert are in no alert's `suppressed`.
+    if (engine.unreported_suppressed() != 0) {
+        err << ", " << engine.unreported_suppressed() << " suppressed crossings after the last alert";
+    }
+    err << ")\n";
     return kOk;
 }
 

@@ -1,9 +1,12 @@
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <ostream>
 #include <sstream>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -41,11 +44,18 @@ Result run(const std::vector<std::string>& args) {
     return r;
 }
 
+/// Unique per call, so two test processes running at once never share a scratch directory.
+std::string unique_suffix() {
+    static int counter = 0;
+    return std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+           std::to_string(++counter);
+}
+
 /// A fresh scratch directory under the system temp dir, removed on scope exit.
 class TempDir {
 public:
     explicit TempDir(const std::string& tag)
-        : path_(fs::temp_directory_path() / ("loganalyzer_cli_test_" + tag)) {
+        : path_(fs::temp_directory_path() / ("loganalyzer_cli_test_" + tag + "_" + unique_suffix())) {
         std::error_code ec;
         fs::remove_all(path_, ec);
         fs::create_directories(path_);
@@ -327,4 +337,123 @@ TEST(Cli, AlertsUsageAndRuntimeErrors) {
 
     CHECK_EQ(run({"alerts", dir.file("missing.log"), "--rule", "name=x,threshold=1,window=1s"}).code, 1);
     CHECK_EQ(run({"alerts", dir.file("a.log"), "--rules-file", dir.file("nope.txt")}).code, 1);
+}
+
+// ---- added after review -----------------------------------------------------------------
+
+namespace {
+
+/// A stream buffer that refuses every write, to simulate a full disk or a closed pipe.
+class FailingBuf : public std::streambuf {
+protected:
+    int_type overflow(int_type) override { return traits_type::eof(); }
+    std::streamsize xsputn(const char*, std::streamsize) override { return 0; }
+};
+
+}  // namespace
+
+TEST(Cli, InputWildcardsExpandInSortedOrder) {
+    TempDir dir("glob");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "40", "--services", "b,a,c"}).code, 0);
+    write_text(dir.file("logs/notes.txt"), "not a log\n");
+
+    Result globbed = run({"merge", dir.file("logs") + "/*.log"});
+    CHECK_EQ(globbed.code, 0);
+    CHECK(globbed.err.find("merged 120 entries from 3 files") != std::string::npos);
+
+    // Same result as naming the files explicitly in name order (a, b, c): the expansion is sorted.
+    Result explicit_files = run({"merge", dir.file("logs/a.log"), dir.file("logs/b.log"), dir.file("logs/c.log")});
+    CHECK_EQ(explicit_files.code, 0);
+    CHECK_EQ(globbed.out, explicit_files.out);
+
+    Result single_char = run({"merge", dir.file("logs") + "/?.log"});
+    CHECK_EQ(single_char.code, 0);
+    CHECK_EQ(single_char.out, explicit_files.out);
+
+    CHECK_EQ(run({"top-errors", dir.file("logs") + "/*.log", "--k", "2"}).code, 0);
+    CHECK_EQ(run({"alerts", dir.file("logs") + "/*.log", "--rule", "name=x,threshold=3,window=5s"}).code, 0);
+}
+
+TEST(Cli, WildcardErrors) {
+    TempDir dir("glob_errors");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "5", "--services", "a"}).code, 0);
+    Result none = run({"merge", dir.file("logs") + "/*.zzz"});
+    CHECK_EQ(none.code, 1);
+    CHECK(none.err.find("no files match") != std::string::npos);
+    CHECK_EQ(run({"merge", dir.file("lo*") + "/a.log"}).code, 2);  // wildcards only in the file name
+    CHECK_EQ(run({"merge", dir.file("missing-dir") + "/*.log"}).code, 1);
+}
+
+TEST(Cli, RulesFileToleratesAUtf8Bom) {
+    TempDir dir("rules_bom");
+    write_text(dir.file("a.log"), "2026-10-10T00:00:00.000Z ERROR svc boom\n");
+    write_text(dir.file("rules.txt"),
+               "\xEF\xBB\xBF"
+               "# written by PowerShell\n"
+               "name=one,threshold=1,window=1s\n");
+    Result r = run({"alerts", dir.file("a.log"), "--rules-file", dir.file("rules.txt")});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.err.find("with 1 rules: 1 alerts") != std::string::npos);
+
+    write_text(dir.file("rules2.txt"),
+               "\xEF\xBB\xBF"
+               "name=two,threshold=1,window=1s\n");
+    CHECK_EQ(run({"alerts", dir.file("a.log"), "--rules-file", dir.file("rules2.txt")}).code, 0);
+}
+
+TEST(Cli, RulesFileInUtf16IsRejectedWithAClearMessage) {
+    TempDir dir("rules_utf16");
+    write_text(dir.file("a.log"), "2026-10-10T00:00:00.000Z ERROR svc boom\n");
+    std::string utf16("\xFF\xFE", 2);  // little-endian byte-order mark, then two bytes per character
+    for (char c : std::string("name=a,threshold=1,window=1s\n")) {
+        utf16 += c;
+        utf16 += '\0';
+    }
+    write_text(dir.file("rules.txt"), utf16);
+    Result r = run({"alerts", dir.file("a.log"), "--rules-file", dir.file("rules.txt")});
+    CHECK_EQ(r.code, 1);
+    CHECK(r.err.find("UTF-16") != std::string::npos);
+}
+
+TEST(Cli, RulesFileWithAStrayControlZIsAnErrorNotASilentTruncation) {
+    TempDir dir("rules_ctrlz");
+    write_text(dir.file("a.log"), "2026-10-10T00:00:00.000Z ERROR svc boom\n");
+    write_text(dir.file("rules.txt"),
+               "name=a,threshold=2,window=1s\n"
+               "\x1A\n"
+               "name=b,threshold=1,window=1s\n");
+    Result r = run({"alerts", dir.file("a.log"), "--rules-file", dir.file("rules.txt")});
+    CHECK_EQ(r.code, 2);  // used to exit 0 with rule b silently dropped
+    CHECK(r.err.find("rules.txt:2:") != std::string::npos);
+}
+
+TEST(Cli, AlertsRejectsAnEmptyServiceInARule) {
+    TempDir dir("alerts_empty_service");
+    write_text(dir.file("a.log"), "2026-10-10T00:00:00.000Z ERROR svc boom\n");
+    Result r = run({"alerts", dir.file("a.log"), "--rule", "name=x,threshold=1,window=1s,service="});
+    CHECK_EQ(r.code, 2);
+    CHECK(r.err.find("service must not be empty") != std::string::npos);
+}
+
+TEST(Cli, AlertsSummaryReportsSuppressedCrossingsAfterTheLastAlert) {
+    TempDir dir("alerts_tail");
+    write_text(dir.file("a.log"),
+               "2026-10-10T00:00:00.000Z ERROR svc boom\n"
+               "2026-10-10T00:00:00.001Z ERROR svc boom\n"
+               "2026-10-10T00:00:00.002Z ERROR svc boom\n");
+    Result r = run({"alerts", dir.file("a.log"), "--rule", "name=x,threshold=1,window=1s,cooldown=1m"});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.err.find("1 alerts") != std::string::npos);
+    CHECK(r.err.find("2 suppressed crossings after the last alert") != std::string::npos);
+}
+
+TEST(Cli, AlertsFailsWhenTheOutputCannotBeWritten) {
+    TempDir dir("alerts_write_fail");
+    write_text(dir.file("a.log"), "2026-10-10T00:00:00.000Z ERROR svc boom\n");
+    FailingBuf buffer;
+    std::ostream broken(&buffer);
+    std::ostringstream err;
+    const int code = run_cli({"alerts", dir.file("a.log"), "--rule", "name=x,threshold=1,window=1s"}, broken, err);
+    CHECK_EQ(code, 1);  // used to exit 0 with the alert lost
+    CHECK(err.str().find("write failed") != std::string::npos);
 }
