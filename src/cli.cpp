@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -29,6 +30,7 @@
 #include "loganalyzer/log_generator.hpp"
 #include "loganalyzer/log_merger.hpp"
 #include "loganalyzer/log_parser.hpp"
+#include "loganalyzer/report.hpp"
 #include "loganalyzer/top_k_errors.hpp"
 #include "loganalyzer/trie.hpp"
 #include "loganalyzer/wildcard.hpp"
@@ -61,6 +63,9 @@ Usage:
         name=NAME,threshold=N,window=60s[,service=S][,level=ERROR][,cooldown=5m][,per-service=true]
       Fires when >= N matching entries fall inside the window; cooldown suppresses repeats.
       A rules file holds one SPEC per line; lines starting with '#' are comments.
+  loganalyzer report FILE... [--out report.html] [--title T] [--top N] [--buckets N] [--rule SPEC ...] [--rules-file F]
+      One self-contained HTML dashboard (no scripts, no network): summary, levels, services,
+      timeline, top error signatures and, with rules, the alerts they fire. Stdout without --out.
   loganalyzer grep PATTERN FILE... [--ignore-case] [--level LEVEL] [--service NAME] [--max N] [--count]
       Entries whose message contains PATTERN (KMP substring search); --level is a minimum.
   loganalyzer search QUERY FILE... [--limit N] [--count]
@@ -659,6 +664,69 @@ int cmd_complete(const std::vector<std::string>& args, std::ostream& out, std::o
     return kOk;
 }
 
+int cmd_report(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    const ParsedArgs parsed = parse_args(args, {"--out", "--title", "--top", "--buckets", "--rules-file"}, {"--rule"});
+    if (parsed.positional.empty()) throw UsageError("report needs at least one FILE");
+    const std::vector<std::string> files = expand_inputs(parsed.positional);
+
+    ReportOptions options;
+    if (parsed.has("--title")) options.title = parsed.options.at("--title");
+    options.top_k = static_cast<std::size_t>(uint_option(parsed, "--top", options.top_k, 1, 1000));
+    options.time_buckets = static_cast<std::size_t>(uint_option(parsed, "--buckets", options.time_buckets, 1, 400));
+
+    AlertEngine engine;
+    for (const std::string& spec : parsed.all("--rule")) {
+        try {
+            engine.add_rule(parse_rule_spec(spec));
+        } catch (const std::invalid_argument& e) {
+            throw UsageError("bad --rule '" + spec + "': " + e.what());
+        }
+    }
+    if (parsed.has("--rules-file")) load_rules_file(parsed.options.at("--rules-file"), engine);
+
+    std::size_t malformed = 0;
+    std::vector<std::vector<LogEntry>> sources;
+    sources.reserve(files.size());
+    for (const std::string& path : files) {
+        sources.push_back(load_file(path, malformed));
+        if (engine.rule_count() != 0) require_sorted(path, sources.back());  // rules need a time-ordered stream
+    }
+
+    std::vector<LogEntry> entries;
+    std::vector<Alert> alerts;
+    if (engine.rule_count() != 0) {
+        KWayMerger merger(std::move(sources));
+        entries.reserve(merger.remaining());
+        while (merger.has_next()) {
+            entries.push_back(merger.next());
+            for (Alert& alert : engine.process(entries.back())) alerts.push_back(std::move(alert));
+        }
+    } else {
+        for (std::vector<LogEntry>& source : sources) {
+            entries.insert(entries.end(), std::make_move_iterator(source.begin()), std::make_move_iterator(source.end()));
+        }
+    }
+
+    const std::string html = render_html_report(entries, alerts, options);
+    if (parsed.has("--out")) {
+        const std::string& path = parsed.options.at("--out");
+        std::ofstream file(path, std::ios::binary);
+        if (!file) throw std::runtime_error("cannot write file: " + path);
+        file.write(html.data(), static_cast<std::streamsize>(html.size()));
+        file.flush();
+        if (!file) throw std::runtime_error("write failed: " + path);
+    } else {
+        out.write(html.data(), static_cast<std::streamsize>(html.size()));
+        out.flush();
+        if (!out) throw std::runtime_error("write failed");
+    }
+    err << "report: " << entries.size() << " entries, " << alerts.size() << " alerts, " << malformed
+        << " malformed lines skipped";
+    if (parsed.has("--out")) err << " -> " << parsed.options.at("--out");
+    err << "\n";
+    return kOk;
+}
+
 struct BenchRow {
     std::string stage;
     double millis;
@@ -771,6 +839,7 @@ int run_cli(const std::vector<std::string>& args, std::ostream& out, std::ostrea
         if (command == "merge") return cmd_merge(args, out, err);
         if (command == "top-errors") return cmd_top_errors(args, out);
         if (command == "alerts") return cmd_alerts(args, out, err);
+        if (command == "report") return cmd_report(args, out, err);
         if (command == "grep") return cmd_grep(args, out, err);
         if (command == "search") return cmd_search(args, out, err);
         if (command == "complete") return cmd_complete(args, out, err);

@@ -676,3 +676,75 @@ TEST(Cli, CompleteUsageErrors) {
     CHECK_EQ(run({"complete", dir.file("a.log"), "--min-level", "loud"}).code, 2);
     CHECK_EQ(run({"complete", dir.file("missing.log")}).code, 1);
 }
+
+// ---- Week 4: report ----------------------------------------------------------------------
+
+namespace {
+
+std::string read_text(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+std::size_t occurrences(const std::string& haystack, const std::string& needle) {
+    std::size_t n = 0;
+    for (std::size_t pos = haystack.find(needle); pos != std::string::npos; pos = haystack.find(needle, pos + needle.size())) ++n;
+    return n;
+}
+
+}  // namespace
+
+TEST(Cli, ReportWritesASelfContainedHtmlFile) {
+    TempDir dir("report");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "500", "--services", "a,b"}).code, 0);
+    Result r = run({"report", dir.file("logs") + "/*.log", "--out", dir.file("report.html"), "--title", "My <report>",
+                    "--top", "3", "--buckets", "20"});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.err.find("report: 1000 entries, 0 alerts") != std::string::npos);
+
+    const std::string html = read_text(dir.file("report.html"));
+    CHECK(html.compare(0, 15, "<!doctype html>") == 0);
+    CHECK(html.find("<title>My &lt;report&gt;</title>") != std::string::npos);
+    CHECK_EQ(occurrences(html, "<g class=\"bucket\">"), std::size_t{20});
+    CHECK(html.find("<b>1000</b><span>entries</span>") != std::string::npos);
+    CHECK(html.find("Top error signatures") != std::string::npos);
+    CHECK(html.find("<script") == std::string::npos);
+    CHECK(html.find("http://") == std::string::npos && html.find("https://") == std::string::npos);  // no external resources
+}
+
+TEST(Cli, ReportWithRulesListsTheAlertsTheyFire) {
+    TempDir dir("report_rules");
+    write_text(dir.file("a.log"),
+               "2026-10-10T00:00:00.000Z ERROR svc boom 1\n"
+               "2026-10-10T00:00:00.100Z ERROR svc boom 2\n"
+               "2026-10-10T00:00:00.200Z ERROR svc boom 3\n");
+    Result r = run({"report", dir.file("a.log"), "--out", dir.file("r.html"), "--rule", "name=burst,threshold=3,window=1s"});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.err.find("3 entries, 1 alerts") != std::string::npos);
+    const std::string html = read_text(dir.file("r.html"));
+    CHECK(html.find("<b>1</b><span>alerts fired</span>") != std::string::npos);
+    CHECK(html.find("<td>burst</td>") != std::string::npos);
+}
+
+TEST(Cli, ReportToStdoutAndErrors) {
+    TempDir dir("report_errors");
+    write_text(dir.file("a.log"), "2026-10-10T00:00:01.000Z INFO svc fine\n");
+    Result r = run({"report", dir.file("a.log")});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.compare(0, 15, "<!doctype html>") == 0);
+    CHECK(r.out.find("No ERROR entries.") != std::string::npos);
+
+    CHECK_EQ(run({"report"}).code, 2);
+    CHECK_EQ(run({"report", dir.file("a.log"), "--top", "0"}).code, 2);
+    CHECK_EQ(run({"report", dir.file("a.log"), "--buckets", "401"}).code, 2);
+    CHECK_EQ(run({"report", dir.file("a.log"), "--rule", "name=x"}).code, 2);
+    CHECK_EQ(run({"report", dir.file("missing.log")}).code, 1);
+    CHECK_EQ(run({"report", dir.file("a.log"), "--out", dir.file("no-such-dir") + "/r.html"}).code, 1);
+
+    // Unsorted input is fine for a plain report (nothing needs the order), an error once rules do.
+    write_text(dir.file("unsorted.log"),
+               "2026-10-10T00:00:02.000Z INFO svc second\n"
+               "2026-10-10T00:00:01.000Z INFO svc first\n");
+    CHECK_EQ(run({"report", dir.file("unsorted.log")}).code, 0);
+    CHECK_EQ(run({"report", dir.file("unsorted.log"), "--rule", "name=x,threshold=1,window=1s"}).code, 1);
+}
