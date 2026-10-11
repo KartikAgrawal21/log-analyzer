@@ -1,3 +1,12 @@
+// GCC 15 enables -fassume-sane-operators-new-delete at -O1 and above: the optimizer then assumes
+// a replaced global operator new reads and writes no program state, so it may move the calls
+// that allocate across the reads of the allocation counter below, and every count in this file
+// becomes wrong - only when optimized (find_all with no match "allocated once"). The probe exists
+// precisely because operator new has a side effect, so switch that assumption off for this file.
+// (The pragma comes first so that everything this file includes is compiled the same way.)
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 15
+#pragma GCC optimize("no-assume-sane-operators-new-delete")
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cctype>

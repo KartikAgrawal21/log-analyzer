@@ -840,7 +840,7 @@ std::vector<Completion> expected_top(const std::map<std::string, std::uint64_t>&
 }
 
 void check_against_reference(const Trie& trie, const std::map<std::string, std::uint64_t>& reference) {
-    for (const std::string prefix : {std::string(), std::string("key"), std::string("key1"), std::string("zz")}) {
+    for (const std::string& prefix : {std::string(), std::string("key"), std::string("key1"), std::string("zz")}) {
         for (const std::size_t k : {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{50}}) {
             const std::vector<Completion> want = expected_top(reference, prefix, k);
             const std::vector<Completion> got = trie.complete(prefix, k);
