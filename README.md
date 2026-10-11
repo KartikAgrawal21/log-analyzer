@@ -11,7 +11,7 @@ on a problem every backend team actually has.
 |------|-----------|-----|
 | 1 ✅ | Log generator + parser, k-way merge of per-service logs by timestamp, Top-K error signatures | min-heap, hash map, k-way merge |
 | 2 ✅ | Real-time alert rules ("more than N errors in W seconds"), cooldowns | sliding window (ring buffer), per-rule hash map |
-| 3 | Search: prefix autocomplete, keyword search, multi-keyword queries | trie, KMP, inverted index |
+| 3 ✅ | Search: prefix autocomplete, keyword search, multi-keyword queries | trie, KMP, inverted index |
 | 4 | CLI polish, dashboard / HTTP API | — |
 | 5 | Probabilistic structures + benchmarks on 1M logs | Count-Min Sketch, HyperLogLog |
 
@@ -50,8 +50,43 @@ loganalyzer generate --out-dir DIR [--count N] [--seed S] [--services a,b,c]
 loganalyzer merge FILE... [--out FILE]
 loganalyzer top-errors FILE... [--k N] [--min-level LEVEL]
 loganalyzer alerts FILE... --rule SPEC [--rule SPEC ...] [--rules-file FILE]
+loganalyzer grep PATTERN FILE... [--ignore-case] [--level LEVEL] [--service NAME] [--max N] [--count]
+loganalyzer search QUERY FILE... [--limit N] [--count]
+loganalyzer complete FILE... [--prefix P] [--field signature|service|word] [--k N] [--min-level LEVEL]
 loganalyzer bench [--count N]
 ```
+
+### Search
+
+On 100,000 generated entries:
+
+```
+$ loganalyzer grep "timed out" *.log --level warn --max 3        # KMP substring search in messages
+2026-10-10T00:00:05.873Z ERROR auth-service Database connection to 10.166.27.47:80 timed out after 12127ms
+2026-10-10T00:00:07.206Z ERROR auth-service Database connection to 10.141.168.154:443 timed out after 26310ms
+2026-10-10T00:00:15.072Z ERROR auth-service Database connection to 10.181.14.150:6379 timed out after 19639ms
+matched 160 of 100000 entries (0 malformed skipped), showing the first 3
+
+$ loganalyzer search "payment error timeout|refused -retry" *.log --limit 3   # inverted index
+2026-10-10T00:00:01.017Z ERROR order-service Timeout waiting for payment confirmation on order 667744208 after 10927ms
+...
+453 matches among 100000 entries (193916 distinct terms, 0 malformed skipped), showing the first 3
+
+$ loganalyzer complete *.log --prefix Payment --k 3                # trie autocomplete over error signatures
+Top 3 signature completions of 'Payment' (115 distinct, 100000 entries)
+
+COUNT  signature
+ 6056  Payment <UUID> authorized for order <N>
+  295  Payment <UUID> pending longer than expected
+  105  Payment <UUID> failed: insufficient funds
+```
+
+`search` indexes each entry as `service LEVEL message`, case-insensitively, so a query can name a
+service or a level as well as words from the message. Query language: space-separated words are all
+required (AND); `a|b` means either (OR); a leading `-` excludes (NOT); `payment-service` means both
+`payment` and `service`. A query of only negated words returns everything that matches none of them.
+`complete --field` chooses what to autocomplete: normalized error `signature`s (default), `service`
+names, or message `word`s (prefix matching is case-insensitive for words).
 
 ### Alert rules
 
@@ -138,11 +173,21 @@ output of every stage is checked for correctness before the numbers are printed)
 | Top-K errors | `top_k_errors.hpp`, `error_signature.hpp` | hash map keyed by (service, signature), bounded size-k heap for O(n log k) selection, single-pass scanner for normalization |
 | Ring buffer | `ring_buffer.hpp` | growable circular buffer (power-of-two capacity, mask indexing), amortized O(1) push/pop, written instead of using `std::deque` |
 | Alert engine | `alert_engine.hpp` | sliding window over a ring buffer (each timestamp enters and leaves once: amortized O(1) per entry), rules indexed by service in a hash map, overflow-safe unsigned time arithmetic |
+| Trie | `trie.hpp` | contiguous node/edge/cache pools with 32-bit indices, sorted-edge binary search, per-node top-k cache (weights only increase, so an evicted key never has to return), bounded-MinHeap DFS fallback for larger k, iterative everywhere (1M-byte keys) |
+| KMP matcher | `kmp.hpp` | prefix-function table, never-backtracking scan with an amortized linearity argument, overlapping matches, locale-independent ASCII folding |
+| Inverted index | `inverted_index.hpp` | tokenizer, ascending posting lists, adaptive intersection (galloping when one list is 16x shorter, otherwise two-pointer merge), MinHeap k-way union, linear difference, cheapest-word-first query planning |
 | Glob matcher | `wildcard.hpp` | two-pointer `*` / `?` matching with last-star backtracking (no recursion, no exponential blow-up) |
 | Parser | `log_parser.hpp` | Hinnant days-from-civil calendar math, string_view slicing, block-based stream reading |
 | Generator | `log_generator.hpp` | xoshiro256** PRNG, Zipf-weighted template choice, exact-integer level thresholds |
 
 ## Known limitations (follow-ups from review)
+
+- Trie: breaking a weight tie compares keys byte by byte, so inserting many near-identical multi-megabyte keys with
+  equal weights is quadratic in key length (documented in `trie.hpp`; ordinary keys are unaffected). Its per-node
+  caches cost up to 4 bytes x K per node.
+- Inverted index: about 150 bytes per distinct term, and numeric ids are tokens too, so a log with millions of
+  unique ids indexes millions of terms (the 100k demo above has 193,916). `search` loads all input into memory.
+- Search commands read whole files, like `alerts`; they are batch tools, not tail-followers.
 
 - `GeneratorConfig::start_ms` accepts values (up to +/-2^62) whose timestamps cannot be formatted back; sane dates are fine.
 - `parse_stream` treats a leading UTF-8 BOM as part of the first line (that line is counted malformed).
