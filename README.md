@@ -50,11 +50,25 @@ loganalyzer generate --out-dir DIR [--count N] [--seed S] [--services a,b,c]
 loganalyzer merge FILE... [--out FILE]
 loganalyzer top-errors FILE... [--k N] [--min-level LEVEL]
 loganalyzer alerts FILE... --rule SPEC [--rule SPEC ...] [--rules-file FILE]
+loganalyzer report FILE... [--out report.html] [--title T] [--top N] [--buckets N] [--rule SPEC ...] [--rules-file F]
 loganalyzer grep PATTERN FILE... [--ignore-case] [--level LEVEL] [--service NAME] [--max N] [--count]
 loganalyzer search QUERY FILE... [--limit N] [--count]
 loganalyzer complete FILE... [--prefix P] [--field signature|service|word] [--k N] [--min-level LEVEL]
 loganalyzer bench [--count N]
 ```
+
+### Dashboard
+
+`loganalyzer report logs\*.log --rules-file rules.txt --out report.html` writes one self-contained HTML page
+(100,000 entries and 26 alerts below; the page is ~36 KB):
+
+![dashboard](docs/report.jpg)
+
+It has summary tiles, the share of each level, a per-service table, a timeline of stacked bars (hover a bar for the
+exact counts), the top error signatures with first/last seen and an example, and, when you pass rules, the alerts they
+fire. Design choices: no JavaScript and no external resources (the page opens offline and cannot phone home), light and
+dark theme through `prefers-color-scheme`, every piece of log text is HTML-escaped (a log line cannot inject markup;
+there is a test for it), and the output depends only on the input, so the same logs always render the same bytes.
 
 ### Search
 
