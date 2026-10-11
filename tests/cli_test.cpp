@@ -12,11 +12,13 @@
 
 #include "loganalyzer/alert_engine.hpp"
 #include "loganalyzer/cli.hpp"
+#include "loganalyzer/error_signature.hpp"
 #include "loganalyzer/log_entry.hpp"
 #include "loganalyzer/log_generator.hpp"
 #include "loganalyzer/log_merger.hpp"
 #include "loganalyzer/log_parser.hpp"
 #include "loganalyzer/top_k_errors.hpp"
+#include "loganalyzer/trie.hpp"
 #include "testkit.hpp"
 
 using loganalyzer::GeneratorConfig;
@@ -456,4 +458,221 @@ TEST(Cli, AlertsFailsWhenTheOutputCannotBeWritten) {
     const int code = run_cli({"alerts", dir.file("a.log"), "--rule", "name=x,threshold=1,window=1s"}, broken, err);
     CHECK_EQ(code, 1);  // used to exit 0 with the alert lost
     CHECK(err.str().find("write failed") != std::string::npos);
+}
+
+// ---- Week 3: grep / search / complete ---------------------------------------------------
+
+namespace {
+
+/// Five hand-written entries used by the search tests (document ids 0..4, in file order).
+const char* const kSearchLog =
+    "2026-10-10T00:00:00.000Z ERROR payment-service Timeout calling bank gateway\n"
+    "2026-10-10T00:00:01.000Z ERROR payment-service Connection refused to db-3\n"
+    "2026-10-10T00:00:02.000Z INFO auth-service User logged in\n"
+    "2026-10-10T00:00:03.000Z WARN payment-service Retry scheduled after timeout\n"
+    "2026-10-10T00:00:04.000Z ERROR auth-service Token refused\n";
+
+/// Messages (the part after "service ") of the lines in `out`, in order.
+std::vector<std::string> messages_of(const std::string& out) {
+    std::vector<std::string> result;
+    std::istringstream in(out);
+    std::string line;
+    while (std::getline(in, line)) {
+        // "{timestamp} {LEVEL} {service} {message}": skip three spaces.
+        std::size_t pos = 0;
+        for (int i = 0; i < 3; ++i) pos = line.find(' ', pos) + 1;
+        result.push_back(line.substr(pos));
+    }
+    return result;
+}
+
+}  // namespace
+
+TEST(Cli, GrepCountMatchesABruteForceScan) {
+    TempDir dir("grep_count");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "3000", "--services", "a,b"}).code, 0);
+
+    GeneratorConfig config;
+    config.services = {"a", "b"};
+    LogGenerator gen(config);
+    std::size_t expected = 0;
+    std::size_t expected_ci = 0;
+    for (const auto& stream : gen.generate_all(3000)) {
+        for (const LogEntry& e : stream) {
+            if (e.message.find("order") != std::string::npos) ++expected;
+            std::string lower = e.message;
+            for (char& c : lower) {
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            }
+            if (lower.find("order") != std::string::npos) ++expected_ci;
+        }
+    }
+    CHECK(expected > 0);
+
+    Result exact = run({"grep", "order", dir.file("logs") + "/*.log", "--count"});
+    CHECK_EQ(exact.code, 0);
+    CHECK_EQ(exact.out, std::to_string(expected) + "\n");
+    Result folded = run({"grep", "ORDER", dir.file("logs") + "/*.log", "--count", "--ignore-case"});
+    CHECK_EQ(folded.code, 0);
+    CHECK_EQ(folded.out, std::to_string(expected_ci) + "\n");
+    Result wrong_case = run({"grep", "ORDER", dir.file("logs") + "/*.log", "--count"});
+    CHECK_EQ(wrong_case.out, std::string("0\n"));
+}
+
+TEST(Cli, GrepFiltersByLevelAndServiceAndLimitsOutput) {
+    TempDir dir("grep_filters");
+    write_text(dir.file("a.log"), kSearchLog);
+
+    Result all = run({"grep", "refused", dir.file("a.log")});
+    CHECK_EQ(all.code, 0);
+    CHECK_EQ(messages_of(all.out), (std::vector<std::string>{"Connection refused to db-3", "Token refused"}));
+    CHECK(all.err.find("matched 2 of 5 entries") != std::string::npos);
+
+    Result only_auth = run({"grep", "refused", dir.file("a.log"), "--service", "auth-service"});
+    CHECK_EQ(messages_of(only_auth.out), (std::vector<std::string>{"Token refused"}));
+
+    // --level is a MINIMUM: WARN and ERROR entries both qualify.
+    Result warn_up = run({"grep", "timeout", dir.file("a.log"), "--level", "warn", "--ignore-case"});
+    CHECK_EQ(messages_of(warn_up.out),
+             (std::vector<std::string>{"Timeout calling bank gateway", "Retry scheduled after timeout"}));
+    Result error_only = run({"grep", "timeout", dir.file("a.log"), "--level", "error", "--ignore-case"});
+    CHECK_EQ(messages_of(error_only.out), (std::vector<std::string>{"Timeout calling bank gateway"}));
+
+    Result limited = run({"grep", "e", dir.file("a.log"), "--max", "2"});
+    CHECK_EQ(limited.code, 0);
+    CHECK_EQ(messages_of(limited.out).size(), std::size_t{2});
+    CHECK(limited.err.find("showing the first 2") != std::string::npos);
+}
+
+TEST(Cli, GrepUsageErrors) {
+    TempDir dir("grep_errors");
+    write_text(dir.file("a.log"), kSearchLog);
+    CHECK_EQ(run({"grep"}).code, 2);
+    CHECK_EQ(run({"grep", "x"}).code, 2);                                  // no file
+    CHECK_EQ(run({"grep", "", dir.file("a.log")}).code, 2);                // empty pattern
+    CHECK_EQ(run({"grep", "x", dir.file("a.log"), "--count=1"}).code, 2);  // flag with a value
+    CHECK_EQ(run({"grep", "x", dir.file("a.log"), "--level", "loud"}).code, 2);
+    CHECK_EQ(run({"grep", "x", dir.file("a.log"), "--max", "0"}).code, 2);
+    CHECK_EQ(run({"grep", "x", dir.file("missing.log")}).code, 1);
+}
+
+TEST(Cli, SearchSupportsAndOrNotAndServiceAndLevelTerms) {
+    TempDir dir("search");
+    write_text(dir.file("a.log"), kSearchLog);
+    const std::string file = dir.file("a.log");
+
+    auto msgs = [&](const std::string& query) {
+        Result r = run({"search", query, file});
+        CHECK_EQ(r.code, 0);
+        return messages_of(r.out);
+    };
+
+    CHECK_EQ(msgs("timeout"), (std::vector<std::string>{"Timeout calling bank gateway", "Retry scheduled after timeout"}));
+    CHECK_EQ(msgs("TIMEOUT"), msgs("timeout"));  // case-insensitive
+    CHECK_EQ(msgs("payment error"), (std::vector<std::string>{"Timeout calling bank gateway", "Connection refused to db-3"}));
+    CHECK_EQ(msgs("timeout|refused").size(), std::size_t{4});
+    CHECK_EQ(msgs("timeout|refused -retry"),
+             (std::vector<std::string>{"Timeout calling bank gateway", "Connection refused to db-3", "Token refused"}));
+    CHECK_EQ(msgs("-payment"), (std::vector<std::string>{"User logged in", "Token refused"}));
+    CHECK_EQ(msgs("service").size(), std::size_t{5});  // every service name contains "service"
+    CHECK_EQ(msgs("zzzz").size(), std::size_t{0});
+    CHECK_EQ(msgs("db-3"), (std::vector<std::string>{"Connection refused to db-3"}));  // db AND 3
+}
+
+TEST(Cli, SearchCountLimitAndSummary) {
+    TempDir dir("search_limit");
+    write_text(dir.file("a.log"), kSearchLog);
+    Result count = run({"search", "service", dir.file("a.log"), "--count"});
+    CHECK_EQ(count.code, 0);
+    CHECK_EQ(count.out, std::string("5\n"));
+    Result limited = run({"search", "service", dir.file("a.log"), "--limit", "2"});
+    CHECK_EQ(limited.code, 0);
+    CHECK_EQ(messages_of(limited.out).size(), std::size_t{2});
+    CHECK(limited.err.find("5 matches among 5 entries") != std::string::npos);
+    CHECK(limited.err.find("showing the first 2") != std::string::npos);
+}
+
+TEST(Cli, SearchUsageErrors) {
+    TempDir dir("search_errors");
+    write_text(dir.file("a.log"), kSearchLog);
+    CHECK_EQ(run({"search"}).code, 2);
+    CHECK_EQ(run({"search", "x"}).code, 2);
+    CHECK_EQ(run({"search", "x", dir.file("a.log"), "--limit", "0"}).code, 2);
+    CHECK_EQ(run({"search", "x", dir.file("missing.log")}).code, 1);
+    CHECK_EQ(run({"search", "|", dir.file("a.log")}).code, 0);  // odd queries are not errors
+}
+
+TEST(Cli, CompleteRanksServicesByCountThenName) {
+    TempDir dir("complete_service");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "20", "--services", "zeta,alpha,mid"}).code, 0);
+    Result top = run({"complete", dir.file("logs") + "/*.log", "--field", "service", "--k", "2"});
+    CHECK_EQ(top.code, 0);
+    CHECK(top.out.find("Top 2 service completions of ''") != std::string::npos);
+    // All three have 20 entries, so the tie is broken by name: alpha, mid (zeta is cut off).
+    CHECK(top.out.find("alpha") != std::string::npos);
+    CHECK(top.out.find("mid") != std::string::npos);
+    CHECK(top.out.find("zeta") == std::string::npos);
+    CHECK(top.out.find("alpha") < top.out.find("mid"));
+
+    Result prefixed = run({"complete", dir.file("logs") + "/*.log", "--field", "service", "--prefix", "m"});
+    CHECK(prefixed.out.find("mid") != std::string::npos);
+    CHECK(prefixed.out.find("alpha") == std::string::npos);
+    Result none = run({"complete", dir.file("logs") + "/*.log", "--field", "service", "--prefix", "q"});
+    CHECK_EQ(none.code, 0);
+    CHECK(none.out.find("no service starts with 'q'") != std::string::npos);
+}
+
+TEST(Cli, CompleteSignaturesMatchesTheLibraryTrie) {
+    TempDir dir("complete_signature");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "3000", "--services", "a,b"}).code, 0);
+
+    GeneratorConfig config;
+    config.services = {"a", "b"};
+    LogGenerator gen(config);
+    loganalyzer::Trie trie;
+    for (const auto& stream : gen.generate_all(3000)) {
+        for (const LogEntry& e : stream) {
+            const std::string signature = loganalyzer::normalize_signature(e.message);
+            if (!signature.empty()) trie.insert(signature);
+        }
+    }
+    const std::vector<loganalyzer::Completion> expected = trie.complete("Payment", 2);
+    CHECK_EQ(expected.size(), std::size_t{2});  // three "Payment ..." signatures exist; k cuts it to two
+
+    Result r = run({"complete", dir.file("logs") + "/*.log", "--prefix", "Payment", "--k", "2"});
+    CHECK_EQ(r.code, 0);
+    std::size_t cursor = 0;
+    for (const loganalyzer::Completion& c : expected) {
+        const std::size_t at = r.out.find(std::to_string(c.weight) + "  " + c.key + "\n", cursor);
+        CHECK(at != std::string::npos);  // rows appear in the library's order
+        cursor = at;
+    }
+}
+
+TEST(Cli, CompleteWordsIsCaseInsensitiveAndMinLevelFilters) {
+    TempDir dir("complete_word");
+    write_text(dir.file("a.log"),
+               "2026-10-10T00:00:00.000Z ERROR svc Timeout one\n"
+               "2026-10-10T00:00:01.000Z ERROR svc Timeout two\n"
+               "2026-10-10T00:00:02.000Z INFO svc Timeout three\n"
+               "2026-10-10T00:00:03.000Z INFO svc Timer fired\n");
+    Result r = run({"complete", dir.file("a.log"), "--field", "word", "--prefix", "TIM"});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("3  timeout") != std::string::npos);
+    CHECK(r.out.find("1  timer") != std::string::npos);
+    CHECK(r.out.find("timeout") < r.out.find("timer"));
+
+    Result errors_only = run({"complete", dir.file("a.log"), "--field", "word", "--prefix", "tim", "--min-level", "error"});
+    CHECK(errors_only.out.find("2  timeout") != std::string::npos);
+    CHECK(errors_only.out.find("timer") == std::string::npos);
+}
+
+TEST(Cli, CompleteUsageErrors) {
+    TempDir dir("complete_errors");
+    write_text(dir.file("a.log"), kSearchLog);
+    CHECK_EQ(run({"complete"}).code, 2);
+    CHECK_EQ(run({"complete", dir.file("a.log"), "--field", "bogus"}).code, 2);
+    CHECK_EQ(run({"complete", dir.file("a.log"), "--k", "0"}).code, 2);
+    CHECK_EQ(run({"complete", dir.file("a.log"), "--min-level", "loud"}).code, 2);
+    CHECK_EQ(run({"complete", dir.file("missing.log")}).code, 1);
 }

@@ -21,12 +21,16 @@
 #include <vector>
 
 #include "loganalyzer/alert_engine.hpp"
+#include "loganalyzer/error_signature.hpp"
+#include "loganalyzer/inverted_index.hpp"
+#include "loganalyzer/kmp.hpp"
 #include "loganalyzer/level.hpp"
 #include "loganalyzer/log_entry.hpp"
 #include "loganalyzer/log_generator.hpp"
 #include "loganalyzer/log_merger.hpp"
 #include "loganalyzer/log_parser.hpp"
 #include "loganalyzer/top_k_errors.hpp"
+#include "loganalyzer/trie.hpp"
 #include "loganalyzer/wildcard.hpp"
 
 namespace loganalyzer {
@@ -57,6 +61,14 @@ Usage:
         name=NAME,threshold=N,window=60s[,service=S][,level=ERROR][,cooldown=5m][,per-service=true]
       Fires when >= N matching entries fall inside the window; cooldown suppresses repeats.
       A rules file holds one SPEC per line; lines starting with '#' are comments.
+  loganalyzer grep PATTERN FILE... [--ignore-case] [--level LEVEL] [--service NAME] [--max N] [--count]
+      Entries whose message contains PATTERN (KMP substring search); --level is a minimum.
+  loganalyzer search QUERY FILE... [--limit N] [--count]
+      Boolean search over "service LEVEL message" using an inverted index. QUERY is
+      space-separated words, all required; a|b means either; -word excludes. Case-insensitive.
+        e.g. "payment error timeout|refused -retry"
+  loganalyzer complete FILE... [--prefix P] [--field signature|service|word] [--k N] [--min-level LEVEL]
+      Most frequent completions of a prefix (trie autocomplete). Default field: signature.
   loganalyzer bench [--count N]
       Time every stage on N generated entries in total (default 1000000).
   loganalyzer help
@@ -75,8 +87,10 @@ struct ParsedArgs {
     std::vector<std::string> positional;
     std::map<std::string, std::string> options;
     std::map<std::string, std::vector<std::string>> repeated;  // options that may be given many times
+    std::set<std::string> flags;                               // value-less switches that were given
 
     bool has(const std::string& name) const { return options.count(name) != 0; }
+    bool flag(const std::string& name) const { return flags.count(name) != 0; }
     const std::vector<std::string>& all(const std::string& name) const {
         static const std::vector<std::string> kNone;
         auto it = repeated.find(name);
@@ -84,10 +98,12 @@ struct ParsedArgs {
     }
 };
 
-/// "--name value" or "--name=value" for the names in `allowed` or `repeatable`; everything
-/// else is positional. A `repeatable` option may appear any number of times (see all()).
+/// "--name value" or "--name=value" for the names in `allowed` or `repeatable`, bare "--name"
+/// for the value-less `flags`; everything else is positional. A `repeatable` option may
+/// appear any number of times (see all()).
 ParsedArgs parse_args(const std::vector<std::string>& args, const std::set<std::string>& allowed,
-                      const std::set<std::string>& repeatable = {}) {
+                      const std::set<std::string>& repeatable = {},
+                      const std::set<std::string>& flags = {}) {
     ParsedArgs parsed;
     for (std::size_t i = 1; i < args.size(); ++i) {  // args[0] is the command
         const std::string& arg = args[i];
@@ -103,6 +119,11 @@ ParsedArgs parse_args(const std::vector<std::string>& args, const std::set<std::
             name = arg.substr(0, eq);
             value = arg.substr(eq + 1);
             has_value = true;
+        }
+        if (flags.count(name) != 0) {
+            if (has_value) throw UsageError("option " + name + " does not take a value");
+            parsed.flags.insert(name);
+            continue;
         }
         const bool is_repeatable = repeatable.count(name) != 0;
         if (!is_repeatable && allowed.count(name) == 0) throw UsageError("unknown option: " + name);
@@ -489,6 +510,155 @@ int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ost
     return kOk;
 }
 
+/// "--level" style option: a level name, or `fallback` when the option is absent.
+Level level_option(const ParsedArgs& args, const std::string& name, Level fallback) {
+    if (!args.has(name)) return fallback;
+    const std::optional<Level> level = level_from_string(args.options.at(name));
+    if (!level) throw UsageError(name + " must be one of DEBUG, INFO, WARN, ERROR");
+    return *level;
+}
+
+int cmd_grep(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    const ParsedArgs parsed = parse_args(args, {"--level", "--service", "--max"}, {}, {"--ignore-case", "--count"});
+    if (parsed.positional.size() < 2) throw UsageError("grep needs a PATTERN and at least one FILE");
+    const std::string& pattern = parsed.positional.front();
+    if (pattern.empty()) throw UsageError("grep PATTERN must not be empty");
+    const std::vector<std::string> files =
+        expand_inputs(std::vector<std::string>(parsed.positional.begin() + 1, parsed.positional.end()));
+
+    const Level min_level = level_option(parsed, "--level", Level::Debug);
+    const std::string service = parsed.has("--service") ? parsed.options.at("--service") : std::string();
+    const std::size_t max_lines = static_cast<std::size_t>(uint_option(parsed, "--max", 0, 1, 1'000'000'000));
+    const bool count_only = parsed.flag("--count");
+    const KmpMatcher matcher(pattern, parsed.flag("--ignore-case"));
+
+    std::size_t malformed = 0, scanned = 0, matched = 0, printed = 0;
+    {
+        LineWriter writer(out);
+        for (const std::string& path : files) {
+            for (const LogEntry& entry : load_file(path, malformed)) {
+                ++scanned;
+                if (entry.level < min_level) continue;
+                if (!service.empty() && entry.service != service) continue;
+                if (!matcher.contains(entry.message)) continue;
+                ++matched;
+                if (!count_only && (max_lines == 0 || printed < max_lines)) {
+                    writer.write(entry);
+                    ++printed;
+                }
+            }
+        }
+    }
+    if (count_only) out << matched << "\n";
+    out.flush();
+    if (!out) throw std::runtime_error("write failed");
+
+    err << "matched " << matched << " of " << scanned << " entries (" << malformed << " malformed skipped)";
+    if (!count_only && printed < matched) err << ", showing the first " << printed;
+    err << "\n";
+    return kOk;
+}
+
+int cmd_search(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    const ParsedArgs parsed = parse_args(args, {"--limit"}, {}, {"--count"});
+    if (parsed.positional.size() < 2) throw UsageError("search needs a QUERY and at least one FILE");
+    const std::string& query = parsed.positional.front();
+    const std::vector<std::string> files =
+        expand_inputs(std::vector<std::string>(parsed.positional.begin() + 1, parsed.positional.end()));
+    const std::size_t limit = static_cast<std::size_t>(uint_option(parsed, "--limit", 50, 1, 1'000'000'000));
+    const bool count_only = parsed.flag("--count");
+
+    // Each entry is indexed as "service LEVEL message", so queries can name a service or a
+    // level ("payment error timeout") as well as words from the message. DocId = position.
+    std::vector<LogEntry> entries;
+    InvertedIndex index;
+    std::size_t malformed = 0;
+    for (const std::string& path : files) {
+        for (LogEntry& entry : load_file(path, malformed)) {
+            std::string text = entry.service;
+            text += ' ';
+            text += to_string(entry.level);
+            text += ' ';
+            text += entry.message;
+            index.add(text);
+            entries.push_back(std::move(entry));
+        }
+    }
+
+    const std::vector<DocId> hits = index.search(query);
+    std::size_t shown = 0;
+    if (count_only) {
+        out << hits.size() << "\n";
+    } else {
+        LineWriter writer(out);
+        for (DocId id : hits) {
+            if (shown == limit) break;
+            writer.write(entries[id]);
+            ++shown;
+        }
+    }
+    out.flush();
+    if (!out) throw std::runtime_error("write failed");
+
+    err << hits.size() << " matches among " << entries.size() << " entries (" << index.term_count()
+        << " distinct terms, " << malformed << " malformed skipped)";
+    if (!count_only && shown < hits.size()) err << ", showing the first " << shown;
+    err << "\n";
+    return kOk;
+}
+
+int cmd_complete(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    const ParsedArgs parsed = parse_args(args, {"--prefix", "--field", "--k", "--min-level"});
+    if (parsed.positional.empty()) throw UsageError("complete needs at least one FILE");
+    const std::vector<std::string> files = expand_inputs(parsed.positional);
+
+    const std::string field = parsed.has("--field") ? parsed.options.at("--field") : std::string("signature");
+    if (field != "signature" && field != "service" && field != "word") {
+        throw UsageError("--field must be one of signature, service, word");
+    }
+    const std::size_t k = static_cast<std::size_t>(uint_option(parsed, "--k", 10, 1, 1'000'000));
+    const Level min_level = level_option(parsed, "--min-level", Level::Debug);
+    std::string prefix = parsed.has("--prefix") ? parsed.options.at("--prefix") : std::string();
+    if (field == "word") {  // words are indexed lower-case, so make the prefix case-insensitive
+        for (char& c : prefix) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+
+    Trie trie;
+    std::size_t malformed = 0, entries = 0;
+    for (const std::string& path : files) {
+        for (const LogEntry& entry : load_file(path, malformed)) {
+            if (entry.level < min_level) continue;
+            ++entries;
+            if (field == "service") {
+                trie.insert(entry.service);
+            } else if (field == "signature") {
+                const std::string signature = normalize_signature(entry.message);
+                if (!signature.empty()) trie.insert(signature);
+            } else {
+                for (const std::string& token : tokenize(entry.message)) trie.insert(token);
+            }
+        }
+    }
+
+    const std::vector<Completion> best = trie.complete(prefix, k);
+    if (best.empty()) {
+        out << "no " << field << " starts with '" << prefix << "'\n";
+    } else {
+        std::size_t width = 5;
+        for (const Completion& c : best) width = std::max(width, std::to_string(c.weight).size());
+        out << "Top " << best.size() << " " << field << " completions of '" << prefix << "' (" << trie.size()
+            << " distinct, " << entries << " entries)\n\n";
+        out << std::setw(static_cast<int>(width)) << "COUNT" << "  " << field << "\n";
+        for (const Completion& c : best) out << std::setw(static_cast<int>(width)) << c.weight << "  " << c.key << "\n";
+    }
+    out.flush();
+    if (!out) throw std::runtime_error("write failed");
+    err << entries << " entries read (" << malformed << " malformed skipped)\n";
+    return kOk;
+}
+
 struct BenchRow {
     std::string stage;
     double millis;
@@ -601,6 +771,9 @@ int run_cli(const std::vector<std::string>& args, std::ostream& out, std::ostrea
         if (command == "merge") return cmd_merge(args, out, err);
         if (command == "top-errors") return cmd_top_errors(args, out);
         if (command == "alerts") return cmd_alerts(args, out, err);
+        if (command == "grep") return cmd_grep(args, out, err);
+        if (command == "search") return cmd_search(args, out, err);
+        if (command == "complete") return cmd_complete(args, out, err);
         if (command == "bench") return cmd_bench(args, out);
         throw UsageError("unknown command: " + command);
     } catch (const UsageError& e) {
