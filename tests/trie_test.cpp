@@ -819,3 +819,85 @@ TEST(Trie, MovedFromTrieIsEmptyAndReusable) {
     other = std::move(alias);  // self-move must not destroy the trie
     CHECK_EQ(other.size(), std::size_t{2});
 }
+
+// ---- added after review: gaps the reviewers found that no fix pass reached ----------------
+
+namespace {
+
+/// Brute-force answer: keys starting with `prefix`, best k by weight desc then key asc.
+std::vector<Completion> expected_top(const std::map<std::string, std::uint64_t>& reference,
+                                     const std::string& prefix, std::size_t k) {
+    std::vector<Completion> all;
+    for (const auto& entry : reference) {
+        if (entry.first.compare(0, prefix.size(), prefix) == 0) all.push_back(Completion{entry.first, entry.second});
+    }
+    std::sort(all.begin(), all.end(), [](const Completion& a, const Completion& b) {
+        if (a.weight != b.weight) return a.weight > b.weight;
+        return a.key < b.key;  // std::map keys are plain ASCII here, so byte order == string order
+    });
+    if (all.size() > k) all.resize(k);
+    return all;
+}
+
+void check_against_reference(const Trie& trie, const std::map<std::string, std::uint64_t>& reference) {
+    for (const std::string prefix : {std::string(), std::string("key"), std::string("key1"), std::string("zz")}) {
+        for (const std::size_t k : {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{50}}) {
+            const std::vector<Completion> want = expected_top(reference, prefix, k);
+            const std::vector<Completion> got = trie.complete(prefix, k);
+            if (!(want == got)) {
+                throw testkit::Failure{"complete('" + prefix + "', " + std::to_string(k) + ") differs from the reference"};
+            }
+        }
+    }
+}
+
+}  // namespace
+
+TEST(Trie, CopiesAndMovesKeepTheirCacheLimitAndStayCorrectWhenTheyKeepGrowing) {
+    // cached_k = 2 but 30 keys: a copy or move that lost the limit (or the cache blocks) would
+    // answer wrongly as soon as new keys arrive, which the old tests never did after copying.
+    Trie original(2);
+    std::map<std::string, std::uint64_t> reference;
+    for (int i = 0; i < 30; ++i) {
+        const std::string key = "key" + std::to_string(i);
+        original.insert(key, static_cast<std::uint64_t>(i % 7 + 1));
+        reference[key] += static_cast<std::uint64_t>(i % 7 + 1);
+    }
+
+    Trie copied(original);
+    Trie assigned(5);
+    assigned = original;
+    Trie donor1(original);
+    Trie moved(std::move(donor1));
+    Trie donor2(original);
+    Trie move_assigned(9);
+    move_assigned = std::move(donor2);
+
+    std::vector<Trie*> all = {&original, &copied, &assigned, &moved, &move_assigned};
+    for (Trie* t : all) {
+        CHECK_EQ(t->cached_k(), std::size_t{2});  // assignment replaces the limit as well, not just the keys
+        check_against_reference(*t, reference);
+    }
+    // Keep inserting into every copy; each must still agree with the reference.
+    for (int i = 0; i < 40; ++i) {
+        const std::string key = "key" + std::to_string(i % 45);
+        const std::uint64_t amount = static_cast<std::uint64_t>(i % 5 + 1);
+        reference[key] += amount;
+        for (Trie* t : all) t->insert(key, amount);
+    }
+    for (Trie* t : all) check_against_reference(*t, reference);
+    // The original is unaffected by what happened to its copies.
+    Trie fresh(2);
+    for (int i = 0; i < 30; ++i) fresh.insert("key" + std::to_string(i), static_cast<std::uint64_t>(i % 7 + 1));
+    CHECK_EQ(fresh.size(), std::size_t{30});
+}
+
+TEST(Trie, CompletionEqualityComparesKeyAndWeight) {
+    const Completion a{"abc", 3};
+    CHECK(a == Completion({"abc", 3}));
+    CHECK(!(a != Completion({"abc", 3})));
+    CHECK(a != Completion({"abd", 3}));
+    CHECK(a != Completion({"abc", 4}));
+    CHECK(!(a == Completion({"abc", 4})));
+    CHECK(Completion() == Completion({"", 0}));
+}
