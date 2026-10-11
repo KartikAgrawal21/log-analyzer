@@ -207,6 +207,34 @@ void AlertEngine::add_rule(AlertRule rule) {
     list.push_back(index);
 }
 
+std::size_t AlertEngine::tracked_service_windows() const noexcept {
+    std::size_t total = 0;
+    for (const std::unique_ptr<RuleState>& state : rules_) total += state->by_service.size();
+    return total;
+}
+
+std::size_t AlertEngine::expire_idle(std::int64_t now_ms) {
+    std::size_t freed = 0;
+    for (const std::unique_ptr<RuleState>& state : rules_) {
+        if (!state->rule.per_service) continue;
+        const std::uint64_t window = static_cast<std::uint64_t>(state->rule.window_ms);
+        const std::uint64_t cooldown = static_cast<std::uint64_t>(state->rule.cooldown_ms);
+        for (auto it = state->by_service.begin(); it != state->by_service.end();) {
+            const Window& w = it->second;
+            // `now_ms` behind the window's own clock means we cannot tell: keep it.
+            const bool idle = w.has_newest && now_ms >= w.newest && elapsed(w.newest, now_ms) >= window &&
+                              (!w.has_fired || elapsed(w.last_fired, now_ms) >= cooldown) && w.suppressed == 0;
+            if (idle) {
+                it = state->by_service.erase(it);
+                ++freed;
+            } else {
+                ++it;
+            }
+        }
+    }
+    return freed;
+}
+
 std::uint64_t AlertEngine::unreported_suppressed() const noexcept {
     std::uint64_t total = 0;
     for (const std::unique_ptr<RuleState>& state : rules_) {

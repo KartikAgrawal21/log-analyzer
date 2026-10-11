@@ -77,8 +77,8 @@ AlertRule parse_rule_spec(std::string_view spec);
 /// Service names are matched exactly (case-sensitive); a rule whose service never appears
 /// simply never fires. Memory: a window holds one timestamp per entry currently inside it
 /// (needed to report count and first_event_ms), and per-service windows are created on first
-/// use and kept for the engine's lifetime, so a stream with an unbounded number of distinct
-/// services grows without bound.
+/// use. They are kept until expire_idle() frees the ones that went quiet, so a long stream
+/// with many short-lived services should call it periodically.
 class AlertEngine {
 public:
     /// Throws std::invalid_argument on an empty/duplicate/invalid name, a service containing
@@ -102,6 +102,24 @@ public:
     /// alert reports the ones before it). Non-zero after the last entry means the final burst
     /// was under-reported by the alerts themselves.
     std::uint64_t unreported_suppressed() const noexcept;
+
+    /// Frees the per-service windows (of per_service rules) that can no longer affect any
+    /// result, and returns how many it freed. A window is freed only when, at `now_ms`,
+    ///  - everything in it has left the window (now_ms - newest >= window_ms),
+    ///  - its cooldown has run out (or it never fired), and
+    ///  - no suppressed crossing is waiting to be reported by its next alert.
+    /// Such a window would be empty, silent and counter-free: the next entry for that
+    /// service starts exactly the same fresh window, so process() behaves identically with or
+    /// without this call. That holds as long as `now_ms` is not later than the timestamp of
+    /// any entry processed afterwards (pass the timestamp of the entry just processed): the
+    /// engine forgets a freed window's newest timestamp, so an older entry that arrives
+    /// afterwards would be accepted instead of counted as late. Call it every few thousand
+    /// entries to keep memory proportional to the services active within the last window.
+    /// Shared windows (per_service = false) are one per rule and are never freed.
+    std::size_t expire_idle(std::int64_t now_ms);
+
+    /// Per-service windows currently held, summed over all per_service rules.
+    std::size_t tracked_service_windows() const noexcept;
 
 private:
     struct Window {

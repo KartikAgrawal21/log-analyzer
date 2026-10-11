@@ -501,6 +501,9 @@ int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ost
                 << " count=" << a.count << " since=" << format_iso8601_utc(a.first_event_ms)
                 << " suppressed=" << a.suppressed << "\n";
         }
+        // Keep memory proportional to the services active in the last window, not to every
+        // service ever seen (the merged stream is time-ordered, as expire_idle requires).
+        if ((entries & 0xFFF) == 0) engine.expire_idle(entry.timestamp_ms);
     }
     out.flush();
     if (!out) throw std::runtime_error("write failed");
@@ -700,6 +703,7 @@ int cmd_report(const std::vector<std::string>& args, std::ostream& out, std::ost
         while (merger.has_next()) {
             entries.push_back(merger.next());
             for (Alert& alert : engine.process(entries.back())) alerts.push_back(std::move(alert));
+            if ((entries.size() & 0xFFF) == 0) engine.expire_idle(entries.back().timestamp_ms);
         }
     } else {
         for (std::vector<LogEntry>& source : sources) {

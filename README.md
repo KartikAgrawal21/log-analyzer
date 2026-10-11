@@ -203,9 +203,7 @@ output of every stage is checked for correctness before the numbers are printed)
   unique ids indexes millions of terms (the 100k demo above has 193,916). `search` loads all input into memory.
 - Search commands read whole files, like `alerts`; they are batch tools, not tail-followers.
 
-- The alert engine keeps one window per (rule, service) for the engine's lifetime and one timestamp per entry inside a
-  window, so a stream with an unbounded number of distinct services grows without bound. An idle-window eviction pass is a
-  natural follow-up. Service filters are case-sensitive, and a rule that matches nothing is silent.
+- The alert engine keeps one timestamp per entry inside each window, and frees quiet per-service windows only when asked\n  (`AlertEngine::expire_idle`, which the `alerts` and `report` commands call every 4096 entries). Service filters are\n  case-sensitive, and a rule that matches nothing is silent.
 - `alerts` loads all input before replaying it (it needs the k-way merge), so it is a batch tool, not a tail-follower yet.
 
 ## Layout

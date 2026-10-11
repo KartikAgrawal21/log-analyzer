@@ -530,3 +530,105 @@ TEST(ParseRuleSpec, ThresholdAndDurationBoundaries) {
         CHECK(std::string(e.what()).find("greater than zero") != std::string::npos);
     }
 }
+
+// ---- expire_idle: bounded memory without changing any result ----------------------------
+
+TEST(AlertEngineExpiry, FreesExactlyTheWindowsThatWentQuiet) {
+    AlertEngine engine;
+    AlertRule r = rule("r", 100, 1000);  // threshold never reached: only the bookkeeping matters
+    r.per_service = true;
+    engine.add_rule(r);
+    for (int i = 0; i < 500; ++i) engine.process(ev(i, Level::Error, "svc" + std::to_string(i)));
+    CHECK_EQ(engine.tracked_service_windows(), std::size_t{500});
+
+    CHECK_EQ(engine.expire_idle(499), std::size_t{0});    // the oldest entry is only 499 ms old: still inside its window
+    CHECK_EQ(engine.expire_idle(999), std::size_t{0});
+    CHECK_EQ(engine.expire_idle(1000), std::size_t{1});   // svc0 (t = 0) is exactly one window old: gone
+    CHECK_EQ(engine.tracked_service_windows(), std::size_t{499});
+    CHECK_EQ(engine.expire_idle(1249), std::size_t{249}); // svc1..svc249 (t <= 249)
+    CHECK_EQ(engine.expire_idle(5000), std::size_t{250});  // svc250..svc499
+    CHECK_EQ(engine.tracked_service_windows(), std::size_t{0});
+    CHECK_EQ(engine.expire_idle(9999), std::size_t{0});
+}
+
+TEST(AlertEngineExpiry, NeverFreesWhatStillMatters) {
+    // 1. A cooldown still running keeps the window (and with it the "already fired" memory).
+    AlertEngine cool;
+    AlertRule c = rule("c", 1, 100, 1000);
+    c.per_service = true;
+    cool.add_rule(c);
+    CHECK_EQ(cool.process(ev(0, Level::Error, "a")).size(), std::size_t{1});
+    CHECK_EQ(cool.expire_idle(500), std::size_t{0});     // window is empty by now, but the cooldown runs to t = 1000
+    CHECK_EQ(cool.expire_idle(1000), std::size_t{1});
+    CHECK_EQ(cool.process(ev(1000, Level::Error, "a")).size(), std::size_t{1});  // same as if nothing was freed
+
+    // 2. Suppressed crossings waiting to be reported keep the window alive until the next alert.
+    AlertEngine pending;
+    AlertRule p = rule("p", 1, 50, 100);
+    p.per_service = true;
+    pending.add_rule(p);
+    CHECK_EQ(pending.process(ev(0, Level::Error, "a")).size(), std::size_t{1});
+    CHECK_EQ(pending.process(ev(10, Level::Error, "a")).size(), std::size_t{0});  // suppressed
+    CHECK_EQ(pending.expire_idle(10'000), std::size_t{0});
+    const std::vector<Alert> later = pending.process(ev(10'000, Level::Error, "a"));
+    CHECK_EQ(later.size(), std::size_t{1});
+    CHECK_EQ(later[0].suppressed, std::uint64_t{1});
+    CHECK_EQ(pending.expire_idle(20'000), std::size_t{1});  // nothing pending any more
+
+    // 3. A clock that is behind the window's own newest timestamp frees nothing.
+    AlertEngine behind;
+    AlertRule b = rule("b", 100, 10);
+    b.per_service = true;
+    behind.add_rule(b);
+    behind.process(ev(1000, Level::Error, "a"));
+    CHECK_EQ(behind.expire_idle(500), std::size_t{0});
+    CHECK_EQ(behind.expire_idle(std::numeric_limits<std::int64_t>::min()), std::size_t{0});
+
+    // 4. Shared windows and engines without rules are untouched.
+    AlertEngine shared;
+    shared.add_rule(rule("s", 100, 10));
+    shared.process(ev(0));
+    CHECK_EQ(shared.expire_idle(1'000'000), std::size_t{0});
+    CHECK_EQ(shared.tracked_service_windows(), std::size_t{0});
+    CHECK_EQ(AlertEngine().expire_idle(5), std::size_t{0});
+}
+
+TEST(AlertEngineExpiry, ExpiringNeverChangesAnyAlertOnRandomDriftingStreams) {
+    for (std::uint32_t seed = 1; seed <= 12; ++seed) {
+        std::mt19937 rng(seed);
+        AlertEngine plain;
+        AlertEngine pruned;
+        for (AlertEngine* engine : {&plain, &pruned}) {
+            AlertRule a = rule("errors", 3, 100, 25);
+            a.per_service = true;
+            engine->add_rule(a);
+            AlertRule w = rule("warns", 2, 30, 0);
+            w.per_service = true;
+            w.min_level = Level::Warn;
+            engine->add_rule(w);
+            AlertRule shared = rule("shared", 5, 20, 10);
+            shared.min_level = Level::Info;
+            engine->add_rule(shared);
+        }
+
+        std::vector<Alert> from_plain, from_pruned;
+        std::int64_t t = 0;
+        std::size_t freed = 0;
+        for (int i = 0; i < 4000; ++i) {
+            t += rng() % 6;  // 0..5 ms: ties and bursts happen
+            // The set of active services drifts: 4 live ones at a time, so old windows go quiet.
+            const std::string service = "svc" + std::to_string(static_cast<unsigned>(i / 100) * 4 + rng() % 4);
+            const LogEntry entry = ev(t, static_cast<Level>(rng() % 4), service);
+            for (Alert& alert : plain.process(entry)) from_plain.push_back(std::move(alert));
+            for (Alert& alert : pruned.process(entry)) from_pruned.push_back(std::move(alert));
+            if (i % 17 == 0) freed += pruned.expire_idle(t);
+        }
+        CHECK_EQ(from_plain.size(), from_pruned.size());
+        CHECK(!from_plain.empty());
+        for (std::size_t i = 0; i < from_plain.size(); ++i) CHECK(same(from_plain[i], from_pruned[i]));
+        CHECK_EQ(plain.late_events(), pruned.late_events());
+        CHECK_EQ(plain.unreported_suppressed(), pruned.unreported_suppressed());
+        CHECK(freed > 0);
+        CHECK(pruned.tracked_service_windows() < plain.tracked_service_windows());
+    }
+}
