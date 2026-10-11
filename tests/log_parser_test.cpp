@@ -931,3 +931,79 @@ TEST(LogParser, ParseStreamIsConsistentWithFormatEntry) {
         CHECK(parsed[i] == originals[i]);
     }
 }
+
+// ---- added after review: BOM and exceptions() mask handling ------------------------------
+
+TEST(LogParser, ParseStreamSkipsALeadingUtf8Bom) {
+    std::istringstream in(
+        "\xEF\xBB\xBF"
+        "2026-10-10T00:00:01Z INFO a first\n"
+        "2026-10-10T00:00:02Z INFO a second\n");
+    std::size_t malformed = 9;
+    const auto entries = parse_stream(in, &malformed);
+    CHECK_EQ(malformed, std::size_t{0});
+    CHECK_EQ(entries.size(), std::size_t{2});
+    CHECK_EQ(entries[0].message, std::string("first"));
+}
+
+TEST(LogParser, ParseStreamBomAloneOrBeforeBlankLinesIsEmptyInput) {
+    for (const char* text : {"\xEF\xBB\xBF", "\xEF\xBB\xBF\n", "\xEF\xBB\xBF\n\r\n  \n"}) {
+        std::istringstream in(text);
+        std::size_t malformed = 9;
+        CHECK(parse_stream(in, &malformed).empty());
+        CHECK_EQ(malformed, std::size_t{0});
+    }
+}
+
+TEST(LogParser, ParseStreamOnlyTheLeadingBomIsSkipped) {
+    // A BOM in the middle of the input belongs to its line, which is then malformed.
+    std::istringstream in(
+        "2026-10-10T00:00:01Z INFO a ok\n"
+        "\xEF\xBB\xBF"
+        "2026-10-10T00:00:02Z INFO a mid-stream\n");
+    std::size_t malformed = 0;
+    const auto entries = parse_stream(in, &malformed);
+    CHECK_EQ(entries.size(), std::size_t{1});
+    CHECK_EQ(malformed, std::size_t{1});
+
+    // Two bytes of a BOM are just junk.
+    std::istringstream partial("\xEF\xBB\n2026-10-10T00:00:01Z INFO a ok\n");
+    CHECK_EQ(parse_stream(partial, &malformed).size(), std::size_t{1});
+    CHECK_EQ(malformed, std::size_t{1});
+}
+
+TEST(LogParser, ParseStreamSurvivesAnExceptionsMaskAndRestoresIt) {
+    std::string text;
+    for (int i = 0; i < 3000; ++i) {  // > 64 KiB, so several block reads
+        text += "2026-10-10T00:00:" + std::string(i % 60 < 10 ? "0" : "") + std::to_string(i % 60) + "Z INFO svc line " +
+                std::to_string(i) + "\n";
+    }
+    const std::vector<std::ios_base::iostate> masks = {
+        std::ios_base::failbit, std::ios_base::eofbit, std::ios_base::failbit | std::ios_base::eofbit,
+        std::ios_base::badbit | std::ios_base::failbit, std::ios_base::badbit | std::ios_base::failbit | std::ios_base::eofbit};
+    for (std::ios_base::iostate mask : masks) {
+        std::istringstream in(text);
+        in.exceptions(mask);
+        std::size_t malformed = 99;
+        std::vector<LogEntry> entries;
+        bool threw = false;
+        try {
+            entries = parse_stream(in, &malformed);
+        } catch (const std::ios_base::failure&) {
+            threw = true;  // used to happen at the end of the input and discard every entry
+        }
+        CHECK(!threw);
+        CHECK_EQ(entries.size(), std::size_t{3000});
+        CHECK_EQ(malformed, std::size_t{0});
+        CHECK(in.exceptions() == mask);                    // the caller's mask is back in place
+        CHECK(!in.fail());                                 // reaching the end is not a failure
+        CHECK((in.rdstate() & mask) == std::ios_base::goodbit);  // nothing left set that the mask would throw on
+    }
+}
+
+TEST(LogParser, ParseStreamLeavesAnAlreadyFailedStreamFailed) {
+    std::istringstream bad("2026-10-10T00:00:00Z INFO s ok\n");
+    bad.setstate(std::ios::failbit);
+    CHECK(parse_stream(bad).empty());
+    CHECK(bad.fail());  // the caller's failure is not silently cleared
+}

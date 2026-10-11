@@ -113,6 +113,17 @@ std::string format_entry(const LogEntry& entry);
 /// `malformed_count` is non-null it is overwritten (not added to) with that count.
 /// Input is consumed in large blocks and sliced with string_view, so there is no per-line
 /// std::string copy before parsing.
+///
+/// A UTF-8 byte-order mark at the very start of the input (what Windows editors and
+/// PowerShell write) is skipped; one anywhere else stays part of its line.
+///
+/// Stream state: reading to the end of the input is how this function stops, so on return
+/// failbit is clear (unless the stream was already failed when it was passed in, in which case
+/// nothing is read and it stays failed) and eofbit is set. The caller's exceptions() mask is
+/// honoured for real I/O errors (badbit) only; it is suspended while reading and restored on
+/// return, so a mask containing failbit or eofbit no longer makes the end of input throw
+/// away every entry that was parsed. If the mask contains eofbit, eofbit is cleared on return
+/// too, since leaving it set would throw while restoring the mask.
 std::vector<LogEntry> parse_stream(std::istream& in, std::size_t* malformed_count = nullptr);
 
 }  // namespace loganalyzer

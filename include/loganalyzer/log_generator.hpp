@@ -152,14 +152,18 @@ public:
     /// Throws std::invalid_argument if: the service list is empty or has an empty name or a
     /// name containing whitespace (it could not be parsed back); a rate is negative or NaN;
     /// the three rates sum to more than 1 (1e-9 tolerance for rounding); mean_gap_ms is
-    /// negative or above 1e9; or start_ms is outside +/- 2^62 (timestamps could overflow).
+    /// negative or above 1e9; or start_ms is outside [0, 253402300799999] (1970-01-01 to
+    /// 9999-12-31T23:59:59.999Z, the range the log format can write and read back).
     explicit LogGenerator(GeneratorConfig config = {});
 
     const GeneratorConfig& config() const noexcept { return config_; }
 
     /// Next `count` entries of service `service_index`, in timestamp order, with
     /// entry.service == config().services[service_index]. Throws std::out_of_range for a
-    /// bad index.
+    /// bad index, and std::length_error - before anything is generated, leaving the stream
+    /// exactly where it was - if the entries could run past 9999-12-31T23:59:59.999Z (judged by
+    /// the worst case of every gap being 2 * mean_gap_ms, so near the very end of the range a
+    /// request that would in fact have fit can be refused).
     std::vector<LogEntry> generate_service(std::size_t service_index, std::size_t count);
 
     /// Next `count_per_service` entries of every service; result[i] is service i's stream.

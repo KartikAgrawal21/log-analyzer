@@ -836,3 +836,61 @@ TEST(LogGenerator, GoldenOutputIsIdenticalOnEveryPlatform) {
     CHECK_EQ(fnv1a_of_lines(fallback.generate_service(1, 500)), std::uint64_t{0x0f08549248e2a690ULL});
     CHECK_EQ(fnv1a_of_lines(fallback.generate_service(2, 500)), std::uint64_t{0xb8d7959709d37feeULL});
 }
+
+// ---- added after review: the timestamp range must stay formattable ----------------------
+
+namespace {
+constexpr std::int64_t kLastFormattableMs = 253402300799999LL;  // 9999-12-31T23:59:59.999Z
+}
+
+TEST(LogGenerator, StartMsMustBeAFormattableTimestamp) {
+    GeneratorConfig c;
+    c.start_ms = kLastFormattableMs;
+    LogGenerator last(c);
+    const std::vector<LogEntry> one = last.generate_service(0, 1);
+    CHECK_EQ(one.size(), std::size_t{1});
+    CHECK_EQ(format_iso8601_utc(one[0].timestamp_ms), std::string("9999-12-31T23:59:59.999Z"));
+    CHECK(parse_line(format_entry(one[0])).has_value());  // writes out and reads back
+
+    for (const std::int64_t bad : {kLastFormattableMs + 1, std::int64_t{-1}, std::numeric_limits<std::int64_t>::min(),
+                                   std::numeric_limits<std::int64_t>::max(), std::int64_t{1} << 62}) {
+        GeneratorConfig b;
+        b.start_ms = bad;
+        CHECK_THROWS(LogGenerator(b), std::invalid_argument);
+    }
+}
+
+TEST(LogGenerator, RefusesRequestsThatCouldRunPastTheEndOfTimeAndStaysUntouched) {
+    GeneratorConfig c;
+    c.start_ms = kLastFormattableMs - 1000;
+    c.mean_gap_ms = 50;  // worst-case gap 100 ms: room for the first entry plus 10 more
+    LogGenerator refused(c);
+    CHECK_THROWS(refused.generate_service(0, 12), std::length_error);
+    // Nothing was consumed: the stream still starts at start_ms and equals a fresh generator's.
+    LogGenerator fresh(c);
+    CHECK(refused.generate_service(0, 11) == fresh.generate_service(0, 11));
+
+    for (const LogEntry& e : fresh.generate_service(1, 11)) {
+        CHECK(e.timestamp_ms <= kLastFormattableMs);
+        CHECK(parse_line(format_entry(e)).has_value() && *parse_line(format_entry(e)) == e);
+    }
+
+    // Once a stream has consumed its room, asking for more is refused instead of overflowing.
+    bool refused_or_in_range = true;
+    try {
+        for (const LogEntry& e : refused.generate_service(0, 1)) refused_or_in_range = refused_or_in_range && e.timestamp_ms <= kLastFormattableMs;
+    } catch (const std::length_error&) {
+    }
+    CHECK(refused_or_in_range);
+    CHECK(refused.generate_service(0, 0).empty());  // asking for nothing never fails
+}
+
+TEST(LogGenerator, ZeroGapsHaveNoTimeLimit) {
+    GeneratorConfig c;
+    c.start_ms = kLastFormattableMs;
+    c.mean_gap_ms = 0;
+    LogGenerator g(c);
+    const std::vector<LogEntry> many = g.generate_service(0, 5000);
+    CHECK_EQ(many.size(), std::size_t{5000});
+    CHECK_EQ(many.back().timestamp_ms, kLastFormattableMs);
+}

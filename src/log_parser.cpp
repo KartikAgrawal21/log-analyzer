@@ -220,30 +220,68 @@ std::vector<LogEntry> parse_stream(std::istream& in, std::size_t* malformed_coun
     constexpr std::size_t kBlock = 64 * 1024;
     std::vector<char> block(kBlock);
     std::string carry;
-    while (true) {
-        in.read(block.data(), static_cast<std::streamsize>(block.size()));
-        const std::streamsize got = in.gcount();
-        if (got <= 0) break;
 
-        std::string_view rest(block.data(), static_cast<std::size_t>(got));
-        while (!rest.empty()) {
-            const std::size_t newline = rest.find('\n');
-            if (newline == std::string_view::npos) {
-                carry.append(rest.data(), rest.size());
-                break;
+    // Reading up to the end of the input sets eofbit and failbit. With an exceptions() mask
+    // containing failbit (or eofbit) that would throw at the very end and discard every entry
+    // already parsed, so the mask is suspended while reading and put back afterwards.
+    const std::ios_base::iostate old_mask = in.exceptions();
+    const bool already_failed = in.fail();
+    in.exceptions(std::ios_base::goodbit);
+    bool at_start = true;
+    auto read_everything = [&] {
+        while (true) {
+            in.read(block.data(), static_cast<std::streamsize>(block.size()));
+            const std::streamsize got = in.gcount();
+            if (got <= 0) break;
+
+            std::string_view rest(block.data(), static_cast<std::size_t>(got));
+            if (at_start) {
+                at_start = false;
+                // A UTF-8 byte-order mark (Windows editors and PowerShell write one) is not part
+                // of the first line. The first read only returns fewer than 3 bytes at end of input.
+                if (rest.size() >= 3 && rest.substr(0, 3) == std::string_view("\xEF\xBB\xBF", 3)) {
+                    rest.remove_prefix(3);
+                }
             }
-            if (carry.empty()) {
-                handle_line(rest.substr(0, newline));
-            } else {
-                carry.append(rest.data(), newline);
-                handle_line(carry);
-                carry.clear();
+            while (!rest.empty()) {
+                const std::size_t newline = rest.find('\n');
+                if (newline == std::string_view::npos) {
+                    carry.append(rest.data(), rest.size());
+                    break;
+                }
+                if (carry.empty()) {
+                    handle_line(rest.substr(0, newline));
+                } else {
+                    carry.append(rest.data(), newline);
+                    handle_line(carry);
+                    carry.clear();
+                }
+                rest.remove_prefix(newline + 1);
             }
-            rest.remove_prefix(newline + 1);
+            if (!in) break;  // short read: end of input
         }
-        if (!in) break;  // short read: end of input
+    };
+    try {
+        read_everything();
+    } catch (...) {
+        try {
+            in.exceptions(old_mask);
+        } catch (...) {
+            // The original exception is the one worth reporting.
+        }
+        throw;
     }
     if (!carry.empty()) handle_line(carry);  // last line without a trailing '\n'
+
+    // Hitting the end of the input is how this function normally stops, not a failure: leave
+    // failbit clear unless the stream was already failed when it was handed in. Never leave a
+    // bit set that the caller's mask would turn into an exception, except badbit (a real I/O
+    // error, which the caller asked to hear about).
+    std::ios_base::iostate state = in.rdstate();
+    if (!already_failed) state &= ~std::ios_base::failbit;
+    state &= ~(old_mask & ~std::ios_base::badbit);
+    in.clear(state);           // exceptions() is goodbit at this point, so this cannot throw
+    in.exceptions(old_mask);   // throws std::ios_base::failure only if badbit is set and in the mask
 
     if (malformed_count != nullptr) *malformed_count = malformed;
     return entries;

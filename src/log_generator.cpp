@@ -426,7 +426,10 @@ std::size_t pick_template(const Pool& pool, Xoshiro256& rng) {
 
 constexpr std::uint64_t kUnit53 = std::uint64_t{1} << 53;
 constexpr std::int64_t kMaxMeanGapMs = 1'000'000'000;
-constexpr std::int64_t kMaxAbsStartMs = std::int64_t{1} << 62;
+// 9999-12-31T23:59:59.999Z: the last instant format_entry / parse_line can represent. Every
+// generated timestamp must stay within [0, kMaxTimestampMs] so a generated log can always be
+// written out and read back.
+constexpr std::int64_t kMaxTimestampMs = 253402300799999LL;
 
 bool has_whitespace(const std::string& s) noexcept {
     for (char c : s) {
@@ -452,8 +455,8 @@ void validate(const GeneratorConfig& c) {
     if (c.mean_gap_ms < 0 || c.mean_gap_ms > kMaxMeanGapMs) {
         throw std::invalid_argument("GeneratorConfig: mean_gap_ms must be in [0, 1e9]");
     }
-    if (c.start_ms < -kMaxAbsStartMs || c.start_ms > kMaxAbsStartMs) {
-        throw std::invalid_argument("GeneratorConfig: start_ms out of range");
+    if (c.start_ms < 0 || c.start_ms > kMaxTimestampMs) {
+        throw std::invalid_argument("GeneratorConfig: start_ms must be in [0, 9999-12-31T23:59:59.999Z]");
     }
 }
 
@@ -495,6 +498,21 @@ std::vector<LogEntry> LogGenerator::generate_service(std::size_t service_index, 
     const Catalog& catalog = catalogs()[stream.catalog_index];
     const std::string& service = config_.services[service_index];
     const std::uint32_t gap_choices = static_cast<std::uint32_t>(2 * config_.mean_gap_ms + 1);
+
+    // Refuse, before touching any state, a request whose WORST case (every gap at its maximum)
+    // would carry a timestamp past what the log format can represent. The check is
+    // conservative near the end of the range and exact everywhere else; it keeps the stream
+    // untouched when it throws, so the call is all-or-nothing.
+    if (count > 0) {
+        if (stream.next_timestamp_ms > kMaxTimestampMs) {
+            throw std::length_error("LogGenerator: this service's stream has reached the end of the log time range");
+        }
+        const std::uint64_t worst_gap = 2 * static_cast<std::uint64_t>(config_.mean_gap_ms);
+        const std::uint64_t room = static_cast<std::uint64_t>(kMaxTimestampMs - stream.next_timestamp_ms);
+        if (worst_gap != 0 && static_cast<std::uint64_t>(count - 1) > room / worst_gap) {
+            throw std::length_error("LogGenerator: the requested entries could run past 9999-12-31T23:59:59.999Z");
+        }
+    }
 
     std::vector<LogEntry> entries;
     entries.reserve(count);
