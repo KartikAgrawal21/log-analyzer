@@ -13,7 +13,7 @@ on a problem every backend team actually has.
 | 2 ✅ | Real-time alert rules ("more than N errors in W seconds"), cooldowns | sliding window (ring buffer), per-rule hash map |
 | 3 ✅ | Search: prefix autocomplete, keyword search, multi-keyword queries | trie, KMP, inverted index |
 | 4 | CLI polish, dashboard / HTTP API | — |
-| 5 | Probabilistic structures + benchmarks on 1M logs | Count-Min Sketch, HyperLogLog |
+| 5 ✅ | Probabilistic structures + benchmarks on 1M logs | Count-Min Sketch, HyperLogLog |
 
 ## Log format
 
@@ -165,6 +165,32 @@ RANK  COUNT  SERVICE               SIGNATURE
 Thousands of distinct concrete messages (different order ids, IPs, status codes) collapse into
 50 signature groups: 10 error templates x 5 services, exactly what the generator emits.
 
+### Approximate counting in fixed memory
+
+An exact Top-K keeps one counter per distinct group, and an exact distinct count keeps every value. When the number of
+groups is huge that is the memory bill. Two sketches answer the same questions in a constant amount of memory:
+
+```
+$ loganalyzer top-errors logs\*.log --approx --k 3
+Approximate top 3 signature groups (level >= ERROR, 4995 entries, 0 malformed lines skipped)
+Count-Min Sketch 4096 x 4 = 129 KiB total, whatever the number of groups. Counts are estimates: they
+never undercount, and each is off by at most 3.3 (epsilon*N) with probability >= 0.982.
+
+RANK    EST  SERVICE               SIGNATURE
+   1   ~352  order-service         Failed to reserve inventory for order <N>: upstream <IP> returned status <N>
+   2   ~352  notification-service  SMTP delivery to <IP> failed with code <N>
+   3   ~347  inventory-service     Stock level negative for sku <N>: <N> units
+
+$ loganalyzer distinct logs\*.log --field message --exact
+distinct message values over 100000 entries (level >= DEBUG)
+  estimated: 98546   HyperLogLog p=14: 16384 registers = 16 KiB, standard error 0.81%
+  exact:     98772   error -0.23% (a hash set had to remember every distinct value)
+```
+
+`--field` is `service`, `signature`, `message` or `token`; `--precision 4..18` trades memory (2^p bytes) for accuracy
+(standard error 1.04 / sqrt(2^p)). The Count-Min estimates are always >= the true counts, so a heavy hitter is never
+reported too small; the `bench` command fails if it ever sees an undercount.
+
 ## Benchmark
 
 `loganalyzer bench --count 1000000` (single run, MSVC 2019 Release, 94 MiB of log text, the
@@ -172,11 +198,19 @@ output of every stage is checked for correctness before the numbers are printed)
 
 | stage    |     ms | M entries/sec |
 |----------|-------:|--------------:|
-| generate |  235.7 |          4.24 |
-| format   |  261.9 |          3.82 |
-| parse    |  338.8 |          2.95 |
-| merge    |   86.3 |         11.59 |
-| top-k    |   46.8 |         21.37 |
+| generate |  281.6 |          3.55 |
+| format   |  280.2 |          3.57 |
+| parse    |  332.5 |          3.01 |
+| merge    |  108.0 |          9.26 |
+| top-k    |   49.1 |         20.37 |
+| sketch   |   63.0 |         15.88 |
+| hll      |  163.2 |          6.13 |
+
+Accuracy of the fixed-memory structures on the same run:
+
+- **Count-Min Sketch top-10** (259 KiB): agrees with the exact top-10 on 10/10 groups, largest overcount 0 of 49,828 errors.
+- **HyperLogLog** (16 KiB): 985,530 distinct messages estimated against 980,310 exact, an error of +0.53%
+  (its standard error at this precision is 0.81%).
 
 ## What each module uses
 
@@ -190,6 +224,9 @@ output of every stage is checked for correctness before the numbers are printed)
 | Trie | `trie.hpp` | contiguous node/edge/cache pools with 32-bit indices, sorted-edge binary search, per-node top-k cache (weights only increase, so an evicted key never has to return), bounded-MinHeap DFS fallback for larger k, iterative everywhere (1M-byte keys) |
 | KMP matcher | `kmp.hpp` | prefix-function table, never-backtracking scan with an amortized linearity argument, overlapping matches, locale-independent ASCII folding |
 | Inverted index | `inverted_index.hpp` | tokenizer, ascending posting lists, adaptive intersection (galloping when one list is 16x shorter, otherwise two-pointer merge), MinHeap k-way union, linear difference, cheapest-word-first query planning |
+| Count-Min Sketch | `count_min_sketch.hpp` | depth x width counter table, double-hashing row positions from one 64-bit hash, conservative update, never undercounts, mergeable, epsilon/delta sizing |
+| Sketch Top-K | `sketch_top_k.hpp` | Count-Min Sketch plus a size-k candidate set with a lazy-deletion MinHeap (stale entries skipped, heap compacted at 2k): bounded memory regardless of the number of distinct keys |
+| HyperLogLog | `hyperloglog.hpp` | 2^p one-byte registers, leading-zero rank, harmonic-mean estimator with small-range linear counting, mergeable |
 | Glob matcher | `wildcard.hpp` | two-pointer `*` / `?` matching with last-star backtracking (no recursion, no exponential blow-up) |
 | Parser | `log_parser.hpp` | Hinnant days-from-civil calendar math, string_view slicing, block-based stream reading |
 | Generator | `log_generator.hpp` | xoshiro256** PRNG, Zipf-weighted template choice, exact-integer level thresholds |
@@ -203,7 +240,9 @@ output of every stage is checked for correctness before the numbers are printed)
   unique ids indexes millions of terms (the 100k demo above has 193,916). `search` loads all input into memory.
 - Search commands read whole files, like `alerts`; they are batch tools, not tail-followers.
 
-- The alert engine keeps one timestamp per entry inside each window, and frees quiet per-service windows only when asked\n  (`AlertEngine::expire_idle`, which the `alerts` and `report` commands call every 4096 entries). Service filters are\n  case-sensitive, and a rule that matches nothing is silent.
+- The alert engine keeps one timestamp per entry inside each window, and frees quiet per-service windows only when asked
+  (`AlertEngine::expire_idle`, which the `alerts` and `report` commands call every 4096 entries). Service filters are
+  case-sensitive, and a rule that matches nothing is silent.
 - `alerts` loads all input before replaying it (it needs the k-way merge), so it is a batch tool, not a tail-follower yet.
 
 ## Layout
