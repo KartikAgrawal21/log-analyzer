@@ -748,3 +748,156 @@ TEST(Cli, ReportToStdoutAndErrors) {
     CHECK_EQ(run({"report", dir.file("unsorted.log")}).code, 0);
     CHECK_EQ(run({"report", dir.file("unsorted.log"), "--rule", "name=x,threshold=1,window=1s"}).code, 1);
 }
+
+// ---- Week 5: sketches in the CLI ---------------------------------------------------------
+
+namespace {
+
+/// The unsigned integer that follows the first occurrence of `label` in `text`.
+std::uint64_t number_after(const std::string& text, const std::string& label) {
+    const std::size_t at = text.find(label);
+    if (at == std::string::npos) throw testkit::Failure{"label not found: " + label};
+    std::size_t pos = at + label.size();
+    while (pos < text.size() && text[pos] == ' ') ++pos;
+    std::uint64_t value = 0;
+    std::size_t digits = 0;
+    while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+        value = value * 10 + static_cast<std::uint64_t>(text[pos] - '0');
+        ++pos;
+        ++digits;
+    }
+    if (digits == 0) throw testkit::Failure{"no number after: " + label};
+    return value;
+}
+
+}  // namespace
+
+TEST(Cli, TopErrorsApproxMatchesExactCountsWhenTheSketchIsWide) {
+    TempDir dir("approx");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "3000", "--services", "a,b"}).code, 0);
+
+    GeneratorConfig config;
+    config.services = {"a", "b"};
+    LogGenerator gen(config);
+    loganalyzer::TopKErrors exact;
+    for (const auto& stream : gen.generate_all(3000)) {
+        for (const LogEntry& e : stream) exact.add(e);
+    }
+    const auto best = exact.top_k(4);
+    CHECK_EQ(best.size(), std::size_t{4});
+
+    Result r = run({"top-errors", dir.file("logs") + "/*.log", "--approx", "--k", "4", "--width", "65536"});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("Approximate top 4 signature groups") != std::string::npos);
+    CHECK(r.out.find("Count-Min Sketch 65536 x 4") != std::string::npos);
+
+    // A 65536-wide sketch has no collisions among ~20 groups, so every estimate is the exact
+    // count. Ties may be ordered differently from TopKErrors, but the counts, best first, agree.
+    std::size_t cursor = 0;
+    for (const loganalyzer::SignatureCount& g : best) {
+        const std::string needle = "~" + std::to_string(g.count) + "  ";
+        const std::size_t at = r.out.find(needle, cursor);
+        CHECK(at != std::string::npos);
+        cursor = at + needle.size();
+    }
+}
+
+TEST(Cli, TopErrorsApproxNeverUndercountsEvenWithATinySketch) {
+    TempDir dir("approx_tiny");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "2000", "--services", "a,b"}).code, 0);
+
+    GeneratorConfig config;
+    config.services = {"a", "b"};
+    LogGenerator gen(config);
+    loganalyzer::TopKErrors exact;
+    for (const auto& stream : gen.generate_all(2000)) {
+        for (const LogEntry& e : stream) exact.add(e);
+    }
+    std::uint64_t smallest_true_count = ~std::uint64_t{0};
+    for (const auto& g : exact.top_k(exact.distinct())) smallest_true_count = std::min(smallest_true_count, g.count);
+
+    // 16 x 1: every key collides with several others, so estimates are inflated, never deflated.
+    Result r = run({"top-errors", dir.file("logs") + "/*.log", "--approx", "--k", "3", "--width", "16", "--depth", "1"});
+    CHECK_EQ(r.code, 0);
+    const std::uint64_t first_estimate = number_after(r.out, "~");
+    CHECK(first_estimate >= exact.top_k(1)[0].count);
+}
+
+TEST(Cli, TopErrorsApproxUsageErrors) {
+    TempDir dir("approx_errors");
+    write_text(dir.file("a.log"), kSearchLog);
+    const std::string f = dir.file("a.log");
+    CHECK_EQ(run({"top-errors", f, "--width", "100"}).code, 2);                  // needs --approx
+    CHECK_EQ(run({"top-errors", f, "--depth", "2"}).code, 2);
+    CHECK_EQ(run({"top-errors", f, "--approx", "--width", "8"}).code, 2);        // below the minimum width
+    CHECK_EQ(run({"top-errors", f, "--approx", "--depth", "0"}).code, 2);
+    CHECK_EQ(run({"top-errors", f, "--approx", "--depth", "17"}).code, 2);
+    CHECK_EQ(run({"top-errors", f, "--approx=1"}).code, 2);                      // a flag takes no value
+    CHECK_EQ(run({"top-errors", f, "--approx"}).code, 0);
+}
+
+TEST(Cli, TopErrorsApproxOnAFileWithoutErrorsSaysSo) {
+    TempDir dir("approx_none");
+    write_text(dir.file("quiet.log"), "2026-10-10T00:00:01.000Z INFO svc all good\n");
+    Result r = run({"top-errors", dir.file("quiet.log"), "--approx"});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("no entries at level ERROR") != std::string::npos);
+}
+
+TEST(Cli, DistinctCountsServicesExactlyAndMessagesApproximately) {
+    TempDir dir("distinct");
+    CHECK_EQ(run({"generate", "--out-dir", dir.file("logs"), "--count", "4000", "--services", "a,b,c"}).code, 0);
+    const std::string logs = dir.file("logs") + "/*.log";
+
+    Result services = run({"distinct", logs, "--field", "service", "--exact"});
+    CHECK_EQ(services.code, 0);
+    CHECK_EQ(number_after(services.out, "estimated:"), std::uint64_t{3});
+    CHECK_EQ(number_after(services.out, "exact:"), std::uint64_t{3});
+
+    Result messages = run({"distinct", logs, "--field", "message", "--exact"});
+    CHECK_EQ(messages.code, 0);
+    const std::uint64_t estimated = number_after(messages.out, "estimated:");
+    const std::uint64_t truth = number_after(messages.out, "exact:");
+    CHECK(truth > 1000);  // generated messages carry random ids, so most are distinct
+    // p=14 has a standard error of 0.81%; 5% is a very wide, deterministic-data margin.
+    CHECK(estimated * 100 > truth * 95);
+    CHECK(estimated * 100 < truth * 105);
+    CHECK(messages.out.find("HyperLogLog p=14") != std::string::npos);
+
+    Result signatures = run({"distinct", logs, "--field", "signature", "--min-level", "error", "--exact"});
+    CHECK_EQ(signatures.code, 0);
+    CHECK_EQ(number_after(signatures.out, "estimated:"), number_after(signatures.out, "exact:"));  // tiny cardinality
+}
+
+TEST(Cli, DistinctWithoutExactDoesNotPrintTheExactLine) {
+    TempDir dir("distinct_plain");
+    write_text(dir.file("a.log"), kSearchLog);
+    Result r = run({"distinct", dir.file("a.log"), "--field", "token", "--precision", "8"});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("estimated:") != std::string::npos);
+    CHECK(r.out.find("exact:") == std::string::npos);
+    CHECK(r.out.find("HyperLogLog p=8") != std::string::npos);
+}
+
+TEST(Cli, DistinctUsageErrors) {
+    TempDir dir("distinct_errors");
+    write_text(dir.file("a.log"), kSearchLog);
+    const std::string f = dir.file("a.log");
+    CHECK_EQ(run({"distinct"}).code, 2);
+    CHECK_EQ(run({"distinct", f, "--field", "bogus"}).code, 2);
+    CHECK_EQ(run({"distinct", f, "--precision", "3"}).code, 2);
+    CHECK_EQ(run({"distinct", f, "--precision", "19"}).code, 2);
+    CHECK_EQ(run({"distinct", f, "--min-level", "loud"}).code, 2);
+    CHECK_EQ(run({"distinct", dir.file("missing.log")}).code, 1);
+}
+
+TEST(Cli, BenchReportsSketchAndHyperLogLogAccuracy) {
+    Result r = run({"bench", "--count", "20000"});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("sketch") != std::string::npos);
+    CHECK(r.out.find("hll") != std::string::npos);
+    CHECK(r.out.find("Sketch check: top-10 from ") != std::string::npos);
+    CHECK(r.out.find(" KiB agrees with the exact top-10 on ") != std::string::npos);
+    CHECK(r.out.find("HyperLogLog check:") != std::string::npos);
+    CHECK(r.out.find("exact ") != std::string::npos);
+}

@@ -14,15 +14,19 @@
 #include <optional>
 #include <ostream>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "loganalyzer/alert_engine.hpp"
 #include "loganalyzer/error_signature.hpp"
+#include "loganalyzer/hyperloglog.hpp"
 #include "loganalyzer/inverted_index.hpp"
 #include "loganalyzer/kmp.hpp"
 #include "loganalyzer/level.hpp"
@@ -31,6 +35,7 @@
 #include "loganalyzer/log_merger.hpp"
 #include "loganalyzer/log_parser.hpp"
 #include "loganalyzer/report.hpp"
+#include "loganalyzer/sketch_top_k.hpp"
 #include "loganalyzer/top_k_errors.hpp"
 #include "loganalyzer/trie.hpp"
 #include "loganalyzer/wildcard.hpp"
@@ -56,8 +61,12 @@ Usage:
       Write one <service>.log file per service, N lines each (default 10000).
   loganalyzer merge FILE... [--out FILE]
       K-way merge time-sorted log files into one sorted stream (stdout unless --out).
-  loganalyzer top-errors FILE... [--k N] [--min-level LEVEL]
-      Most frequent error signatures (default: top 10 at level ERROR and above).
+  loganalyzer top-errors FILE... [--k N] [--min-level LEVEL] [--approx [--width W] [--depth D]]
+      Most frequent error signatures (default: top 10 at level ERROR and above). With --approx the
+      counts come from a fixed-memory Count-Min Sketch (estimates never undercount).
+  loganalyzer distinct FILE... [--field service|signature|message|token] [--precision P] [--min-level LEVEL] [--exact]
+      Number of distinct values, estimated with HyperLogLog (P = 4..18, default 14 = 16 KiB);
+      --exact also counts them exactly with a hash set and prints the error.
   loganalyzer alerts FILE... --rule SPEC [--rule SPEC ...] [--rules-file FILE]
       Replay the merged logs through sliding-window alert rules. SPEC is comma-separated key=value:
         name=NAME,threshold=N,window=60s[,service=S][,level=ERROR][,cooldown=5m][,per-service=true]
@@ -383,8 +392,82 @@ int cmd_merge(const std::vector<std::string>& args, std::ostream& out, std::ostr
     return kOk;
 }
 
+/// A sketch counts plain strings, so a (service, signature) group is encoded as
+/// "<len>:<service><signature>". The length prefix keeps ("ab","c") and ("a","bc") distinct,
+/// which a bare concatenation would merge.
+std::string sketch_key(const std::string& service, const std::string& signature) {
+    std::string key = std::to_string(service.size());
+    key += ':';
+    key += service;
+    key += signature;
+    return key;
+}
+
+/// Inverse of sketch_key; false when `key` is not one of ours.
+bool split_sketch_key(const std::string& key, std::string& service, std::string& signature) {
+    const std::size_t colon = key.find(':');
+    if (colon == std::string::npos || colon == 0 || colon > 18) return false;
+    std::uint64_t length = 0;
+    for (std::size_t i = 0; i < colon; ++i) {
+        if (key[i] < '0' || key[i] > '9') return false;
+        length = length * 10 + static_cast<std::uint64_t>(key[i] - '0');
+    }
+    if (length > key.size() - colon - 1) return false;
+    service = key.substr(colon + 1, static_cast<std::size_t>(length));
+    signature = key.substr(colon + 1 + static_cast<std::size_t>(length));
+    return true;
+}
+
+/// top-errors with a fixed-memory Count-Min Sketch instead of one counter per group.
+int top_errors_approx(const std::vector<std::string>& files, std::size_t k, Level min_level, std::size_t width,
+                      std::size_t depth, std::ostream& out) {
+    SketchTopK sketch(k, width, depth);
+    std::size_t malformed = 0;
+    for (const std::string& path : files) {
+        for (const LogEntry& entry : load_file(path, malformed)) {
+            if (entry.level < min_level) continue;
+            sketch.add(sketch_key(entry.service, normalize_signature(entry.message)));
+        }
+    }
+
+    const std::vector<HeavyHitter> top = sketch.top();
+    if (top.empty()) {
+        out << "no entries at level " << to_string(min_level) << " or above found (" << malformed
+            << " malformed lines skipped)\n";
+        return kOk;
+    }
+
+    std::size_t count_width = 5;
+    std::size_t service_width = 7;
+    std::vector<std::string> services(top.size()), signatures(top.size());
+    for (std::size_t i = 0; i < top.size(); ++i) {
+        if (!split_sketch_key(top[i].key, services[i], signatures[i])) {
+            throw std::logic_error("sketch returned a key this command did not create");
+        }
+        count_width = std::max(count_width, std::to_string(top[i].estimate).size() + 1);
+        service_width = std::max(service_width, services[i].size());
+    }
+
+    out << "Approximate top " << top.size() << " signature groups (level >= " << to_string(min_level) << ", "
+        << sketch.total() << " entries, " << malformed << " malformed lines skipped)\n";
+    out << "Count-Min Sketch " << sketch.sketch().width() << " x " << sketch.sketch().depth() << " = "
+        << sketch.memory_bytes() / 1024 << " KiB total, whatever the number of groups. Counts are estimates: they\n"
+        << "never undercount, and each is off by at most " << std::fixed << std::setprecision(1)
+        << sketch.sketch().epsilon() * static_cast<double>(sketch.total()) << " (epsilon*N) with probability >= "
+        << std::setprecision(3) << 1.0 - sketch.sketch().delta() << ".\n\n"
+        << std::defaultfloat;
+    out << std::setw(4) << "RANK" << "  " << std::setw(static_cast<int>(count_width)) << "EST" << "  " << std::left
+        << std::setw(static_cast<int>(service_width)) << "SERVICE" << std::right << "  SIGNATURE\n";
+    for (std::size_t i = 0; i < top.size(); ++i) {
+        out << std::setw(4) << i + 1 << "  " << std::setw(static_cast<int>(count_width))
+            << ("~" + std::to_string(top[i].estimate)) << "  " << std::left << std::setw(static_cast<int>(service_width))
+            << services[i] << std::right << "  " << signatures[i] << "\n";
+    }
+    return kOk;
+}
+
 int cmd_top_errors(const std::vector<std::string>& args, std::ostream& out) {
-    const ParsedArgs parsed = parse_args(args, {"--k", "--min-level"});
+    const ParsedArgs parsed = parse_args(args, {"--k", "--min-level", "--width", "--depth"}, {}, {"--approx"});
     if (parsed.positional.empty()) throw UsageError("top-errors needs at least one FILE");
     const std::vector<std::string> files = expand_inputs(parsed.positional);
 
@@ -395,6 +478,13 @@ int cmd_top_errors(const std::vector<std::string>& args, std::ostream& out) {
         if (!level) throw UsageError("--min-level must be one of DEBUG, INFO, WARN, ERROR");
         min_level = *level;
     }
+
+    if (parsed.flag("--approx")) {
+        const std::size_t width = static_cast<std::size_t>(uint_option(parsed, "--width", 4096, 16, 10'000'000));
+        const std::size_t depth = static_cast<std::size_t>(uint_option(parsed, "--depth", 4, 1, 16));
+        return top_errors_approx(files, k, min_level, width, depth, out);
+    }
+    if (parsed.has("--width") || parsed.has("--depth")) throw UsageError("--width and --depth need --approx");
 
     TopKErrors counter(min_level);
     std::size_t malformed = 0;
@@ -731,6 +821,67 @@ int cmd_report(const std::vector<std::string>& args, std::ostream& out, std::ost
     return kOk;
 }
 
+/// Signed relative error in percent, "+0.04%"; "n/a" when there is nothing to divide by.
+std::string percent_error(double estimate, double exact) {
+    if (exact <= 0.0) return "n/a";
+    std::ostringstream os;
+    os << std::showpos << std::fixed << std::setprecision(2) << (estimate - exact) / exact * 100.0 << "%";
+    return os.str();
+}
+
+int cmd_distinct(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    const ParsedArgs parsed = parse_args(args, {"--field", "--precision", "--min-level"}, {}, {"--exact"});
+    if (parsed.positional.empty()) throw UsageError("distinct needs at least one FILE");
+    const std::vector<std::string> files = expand_inputs(parsed.positional);
+
+    const std::string field = parsed.has("--field") ? parsed.options.at("--field") : std::string("signature");
+    if (field != "service" && field != "signature" && field != "message" && field != "token") {
+        throw UsageError("--field must be one of service, signature, message, token");
+    }
+    const unsigned precision = static_cast<unsigned>(uint_option(parsed, "--precision", 14, 4, 18));
+    const Level min_level = level_option(parsed, "--min-level", Level::Debug);
+    const bool exact_too = parsed.flag("--exact");
+
+    HyperLogLog hll(precision);
+    std::unordered_set<std::string> exact;
+    std::size_t entries = 0, malformed = 0;
+    auto add = [&](const std::string& value) {
+        hll.add(value);
+        if (exact_too) exact.insert(value);
+    };
+    for (const std::string& path : files) {
+        for (const LogEntry& entry : load_file(path, malformed)) {
+            if (entry.level < min_level) continue;
+            ++entries;
+            if (field == "service") {
+                add(entry.service);
+            } else if (field == "message") {
+                add(entry.message);
+            } else if (field == "signature") {
+                add(normalize_signature(entry.message));
+            } else {
+                for (const std::string& token : tokenize(entry.message)) add(token);
+            }
+        }
+    }
+
+    out << "distinct " << field << " values over " << entries << " entries (level >= " << to_string(min_level)
+        << ")\n";
+    out << "  estimated: " << hll.count() << "   HyperLogLog p=" << precision << ": " << hll.register_count()
+        << " registers = " << hll.memory_bytes() / 1024.0 << " KiB, standard error " << std::fixed
+        << std::setprecision(2) << hll.standard_error() * 100.0 << "%\n"
+        << std::defaultfloat;
+    if (exact_too) {
+        out << "  exact:     " << exact.size() << "   error " << percent_error(static_cast<double>(hll.count()),
+                                                                           static_cast<double>(exact.size()))
+            << " (a hash set had to remember every distinct value)\n";
+    }
+    out.flush();
+    if (!out) throw std::runtime_error("write failed");
+    err << entries << " entries read (" << malformed << " malformed skipped)\n";
+    return kOk;
+}
+
 struct BenchRow {
     std::string stage;
     double millis;
@@ -802,6 +953,23 @@ int cmd_bench(const std::vector<std::string>& args, std::ostream& out) {
     const std::vector<SignatureCount> top = counter.top_k(10);
     lap("top-k");
 
+    // The same question answered in fixed memory: a Count-Min Sketch behind a top-10 tracker, and
+    // HyperLogLog for the number of distinct messages.
+    mark = Clock::now();
+    SketchTopK sketch(10, 8192, 4);
+    for (const LogEntry& entry : merged) {
+        if (entry.level != Level::Error) continue;
+        sketch.add(sketch_key(entry.service, normalize_signature(entry.message)));
+    }
+    const std::vector<HeavyHitter> heavy = sketch.top();
+    lap("sketch");
+
+    mark = Clock::now();
+    HyperLogLog hll(14);
+    for (const LogEntry& entry : merged) hll.add(entry.message);
+    const std::uint64_t hll_estimate = hll.count();
+    lap("hll");
+
     // Cheap self-checks so a benchmark number never comes from broken output.
     if (merged.size() != total) throw std::runtime_error("bench: merge lost entries");
     if (!std::is_sorted(merged.begin(), merged.end(), [](const LogEntry& a, const LogEntry& b) {
@@ -823,6 +991,38 @@ int cmd_bench(const std::vector<std::string>& args, std::ostream& out) {
     out << "\nTop-K check: " << counter.total() << " errors in " << counter.distinct()
         << " signature groups; most frequent: " << (top.empty() ? "-" : top.front().signature) << " ("
         << (top.empty() ? 0 : top.front().count) << "x)\n";
+
+    // Accuracy of the sketches against the exact answers. A Count-Min estimate may be too high
+    // but never too low, so an undercount means a bug and fails the run.
+    std::unordered_map<std::string, std::uint64_t> exact_counts;
+    std::unordered_set<std::string> exact_top;
+    for (const SignatureCount& g : counter.top_k(counter.distinct())) {
+        exact_counts[sketch_key(g.service, g.signature)] = g.count;
+    }
+    for (const SignatureCount& g : top) exact_top.insert(sketch_key(g.service, g.signature));
+    std::size_t agreed = 0;
+    std::uint64_t max_overcount = 0;
+    for (const HeavyHitter& h : heavy) {
+        const auto it = exact_counts.find(h.key);
+        const std::uint64_t truth = it == exact_counts.end() ? 0 : it->second;
+        if (h.estimate < truth) throw std::runtime_error("bench: the sketch undercounted a key");
+        max_overcount = std::max(max_overcount, h.estimate - truth);
+        if (exact_top.count(h.key) != 0) ++agreed;
+    }
+    out << "Sketch check: top-10 from " << sketch.memory_bytes() / 1024 << " KiB agrees with the exact top-10 on "
+        << agreed << "/" << top.size() << " groups, largest overcount " << max_overcount << " (of "
+        << sketch.total() << " errors)\n";
+
+    if (total <= 5'000'000) {  // the exact distinct count needs a set of every message: bound its memory
+        std::unordered_set<std::string_view> messages;
+        for (const LogEntry& entry : merged) messages.insert(entry.message);
+        out << "HyperLogLog check: " << hll_estimate << " distinct messages estimated from "
+            << hll.memory_bytes() / 1024 << " KiB, exact " << messages.size() << " (error "
+            << percent_error(static_cast<double>(hll_estimate), static_cast<double>(messages.size())) << ")\n";
+    } else {
+        out << "HyperLogLog check: " << hll_estimate << " distinct messages estimated from "
+            << hll.memory_bytes() / 1024 << " KiB (exact comparison skipped above 5,000,000 entries)\n";
+    }
     return kOk;
 }
 
@@ -847,6 +1047,7 @@ int run_cli(const std::vector<std::string>& args, std::ostream& out, std::ostrea
         if (command == "grep") return cmd_grep(args, out, err);
         if (command == "search") return cmd_search(args, out, err);
         if (command == "complete") return cmd_complete(args, out, err);
+        if (command == "distinct") return cmd_distinct(args, out, err);
         if (command == "bench") return cmd_bench(args, out);
         throw UsageError("unknown command: " + command);
     } catch (const UsageError& e) {
