@@ -12,7 +12,7 @@ on a problem every backend team actually has.
 | 1 ✅ | Log generator + parser, k-way merge of per-service logs by timestamp, Top-K error signatures | min-heap, hash map, k-way merge |
 | 2 ✅ | Real-time alert rules ("more than N errors in W seconds"), cooldowns | sliding window (ring buffer), per-rule hash map |
 | 3 ✅ | Search: prefix autocomplete, keyword search, multi-keyword queries | trie, KMP, inverted index |
-| 4 | CLI polish, dashboard / HTTP API | — |
+| 4 ✅ | CLI polish, dashboard / HTTP API | hardened HTTP server on raw sockets, JSON API |
 | 5 ✅ | Probabilistic structures + benchmarks on 1M logs | Count-Min Sketch, HyperLogLog |
 
 ## Log format
@@ -51,6 +51,7 @@ loganalyzer merge FILE... [--out FILE]
 loganalyzer top-errors FILE... [--k N] [--min-level LEVEL]
 loganalyzer alerts FILE... --rule SPEC [--rule SPEC ...] [--rules-file FILE]
 loganalyzer report FILE... [--out report.html] [--title T] [--top N] [--buckets N] [--rule SPEC ...] [--rules-file F]
+loganalyzer serve FILE... [--port 8080] [--bind 127.0.0.1] [--rule SPEC ...] [--allow-host NAME ...] [--max-requests N]
 loganalyzer grep PATTERN FILE... [--ignore-case] [--level LEVEL] [--service NAME] [--max N] [--count]
 loganalyzer search QUERY FILE... [--limit N] [--count]
 loganalyzer complete FILE... [--prefix P] [--field signature|service|word] [--k N] [--min-level LEVEL]
@@ -69,6 +70,39 @@ exact counts), the top error signatures with first/last seen and an example, and
 fire. Design choices: no JavaScript and no external resources (the page opens offline and cannot phone home), light and
 dark theme through `prefers-color-scheme`, every piece of log text is HTML-escaped (a log line cannot inject markup;
 there is a test for it), and the output depends only on the input, so the same logs always render the same bytes.
+
+### Live dashboard and JSON API
+
+`loganalyzer serve logs\*.log --rules-file rules.txt` loads the logs once and serves them over HTTP (default
+`http://127.0.0.1:8080/`, Ctrl+C to stop):
+
+| Route | Answer |
+|-------|--------|
+| `/` | the HTML dashboard above, rendered once at startup |
+| `/healthz` | `ok` |
+| `/api/summary` | entry counts per level and per service, time range, number of alerts |
+| `/api/top-errors?k=10&min-level=ERROR` | the top error signatures (same numbers as `top-errors`) |
+| `/api/search?q=payment+error+-retry&limit=50` | boolean search through the inverted index |
+| `/api/complete?prefix=Fail&field=signature&k=10` | trie autocomplete over `signature`, `service` or `word` |
+| `/api/alerts` | the alerts the rules fired |
+
+```
+$ curl "http://127.0.0.1:8080/api/top-errors?k=1"
+{"total":1251,"distinct":50,"results":[{"service":"auth-service","signature":"Failed to validate token for user <N>: signature mismatch","count":90,"first_seen":"2026-10-10T00:00:02.191Z","last_seen":"2026-10-10T00:04:10.472Z","example":"Failed to validate token for user 88072584: signature mismatch"}]}
+```
+
+The server is a small HTTP/1.1 implementation on raw sockets (Winsock on Windows, BSD sockets elsewhere), and a dashboard
+that reads files an attacker may have written to is a security surface, so the defaults are conservative:
+
+- **Loopback only**, and the `Host` header is checked: a request that names any host other than `localhost`, `127.0.0.1`
+  or the bind address gets **403** before any code runs. That is what stops a web page you visit from reading the
+  dashboard through DNS rebinding. Binding to another address turns the check off with a warning unless you list the
+  names you expect with `--allow-host`.
+- Every response body is valid JSON whatever bytes the logs hold (invalid UTF-8 becomes U+FFFD; `<`, `>` and `&` are
+  escaped), the HTML is escaped and carries a `Content-Security-Policy` that forbids scripts and network fetches.
+- Hard limits: request head size, target length, query-parameter count, total-time read and write deadlines, at most
+  1000 result rows and 4 MiB of rows, log text clipped to 4096 bytes per field, completion keys capped at 256 bytes.
+- GET and HEAD only, one connection at a time, no keep-alive, no request bodies.
 
 ### Search
 
@@ -224,6 +258,9 @@ Accuracy of the fixed-memory structures on the same run:
 | Trie | `trie.hpp` | contiguous node/edge/cache pools with 32-bit indices, sorted-edge binary search, per-node top-k cache (weights only increase, so an evicted key never has to return), bounded-MinHeap DFS fallback for larger k, iterative everywhere (1M-byte keys) |
 | KMP matcher | `kmp.hpp` | prefix-function table, never-backtracking scan with an amortized linearity argument, overlapping matches, locale-independent ASCII folding |
 | Inverted index | `inverted_index.hpp` | tokenizer, ascending posting lists, adaptive intersection (galloping when one list is 16x shorter, otherwise two-pointer merge), MinHeap k-way union, linear difference, cheapest-word-first query planning |
+| HTTP server | `http_server.hpp` | hand-written request-head parser (strict grammar, request-smuggling hardening), percent-decoding, non-blocking sockets with total-time deadlines, `Host` allow-list |
+| Dashboard handler | `serve.hpp` | JSON emitter with UTF-8 repair, lazily built tries under an LRU memory budget, memoized large-k completions, clipping and row/byte caps |
+| Keyed hash | `keyed_hash.hpp` | SipHash-2-4 with a random per-table key, so log text cannot be crafted to collide in the term table or the Top-K group table |
 | Count-Min Sketch | `count_min_sketch.hpp` | depth x width counter table, double-hashing row positions from one 64-bit hash, conservative update, never undercounts, mergeable, epsilon/delta sizing |
 | Sketch Top-K | `sketch_top_k.hpp` | Count-Min Sketch plus a size-k candidate set with a lazy-deletion MinHeap (stale entries skipped, heap compacted at 2k): bounded memory regardless of the number of distinct keys |
 | HyperLogLog | `hyperloglog.hpp` | 2^p one-byte registers, leading-zero rank, harmonic-mean estimator with small-range linear counting, mergeable |
@@ -244,6 +281,12 @@ Accuracy of the fixed-memory structures on the same run:
   (`AlertEngine::expire_idle`, which the `alerts` and `report` commands call every 4096 entries). Service filters are
   case-sensitive, and a rule that matches nothing is silent.
 - `alerts` loads all input before replaying it (it needs the k-way merge), so it is a batch tool, not a tail-follower yet.
+- `serve` is a snapshot server: it loads the files once at startup (no tailing, no reload), answers one connection at a
+  time, and has no TLS or authentication. It is meant for a developer's own machine; keep it on loopback.
+- `serve` memory: the lazily built autocomplete tries cost about 35 bytes per byte of distinct key text and are evicted
+  least-recently-used above a 256 MiB estimate (a single trie can exceed it), the per-level Top-K tables are not under
+  that budget, and a cache build that fails with `bad_alloc` is retried by the next request. The pre-rendered report and
+  summary are not byte-capped.
 
 ## Layout
 
