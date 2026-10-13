@@ -241,3 +241,29 @@ TEST(Report, ExtremeTimestampsDoNotBreakIt) {
     CHECK_EQ(count_of(html, "<g class=\"bucket\">"), std::size_t{60});
     CHECK(has(html, "<b>3</b><span>entries</span>"));
 }
+
+TEST(Report, EntriesSpanningTheWholeInt64RangeNeverOverflowTheTimeline) {
+    const std::int64_t lo = std::numeric_limits<std::int64_t>::min();
+    const std::int64_t hi = std::numeric_limits<std::int64_t>::max();
+    const std::vector<LogEntry> entries = {ev(lo, Level::Error, "s", "boom"), ev(hi, Level::Warn, "s", "hmm"),
+                                           ev(0, Level::Info, "s", "ok")};
+    // The span of 2^64 milliseconds does not fit in 64 bits and saturates at UINT64_MAX. For the
+    // bucket counts that divide 2^64 - 1 (1, 3, 5, 15, 17, 51, 85, 255, ...) the last entry then
+    // used to be sent one slot past the end of the bucket array (a heap-buffer-overflow).
+    for (std::size_t buckets = 1; buckets <= 400; ++buckets) {
+        ReportOptions options;
+        options.time_buckets = buckets;
+        const std::string html = render_html_report(entries, {}, options);
+        CHECK(has(html, "<b>3</b><span>entries</span>"));
+        CHECK_EQ(count_of(html, "<g class=\"bucket\">"), buckets);
+
+        // Every entry lands in exactly one bucket: the tooltip counts add up to 3.
+        std::uint64_t counted = 0;
+        for (std::size_t pos = html.find(" entries ("); pos != std::string::npos; pos = html.find(" entries (", pos + 1)) {
+            std::size_t digits_start = pos;
+            while (digits_start > 0 && html[digits_start - 1] >= '0' && html[digits_start - 1] <= '9') --digits_start;
+            counted += std::stoull(html.substr(digits_start, pos - digits_start));
+        }
+        CHECK_EQ(counted, std::uint64_t{3});
+    }
+}

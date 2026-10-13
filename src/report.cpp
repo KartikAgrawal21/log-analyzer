@@ -142,7 +142,11 @@ void write_timeline(std::ostringstream& out, const std::vector<LogEntry>& entrie
     std::vector<std::array<std::uint64_t, kLevelCount>> buckets(static_cast<std::size_t>(bucket_count));
     for (const LogEntry& e : entries) {
         const std::uint64_t offset = static_cast<std::uint64_t>(e.timestamp_ms) - static_cast<std::uint64_t>(first_ms);
-        ++buckets[static_cast<std::size_t>(offset / width)][level_index(e.level)];
+        // When the entries span all of int64, span saturates at UINT64_MAX (the true count of
+        // milliseconds, 2^64, does not fit), so width * bucket_count can fall one short of the
+        // range and the very last entry would land one past the end: clamp it into the last bucket.
+        const std::uint64_t index = std::min<std::uint64_t>(offset / width, bucket_count - 1);
+        ++buckets[static_cast<std::size_t>(index)][level_index(e.level)];
     }
     std::uint64_t tallest = 1;
     for (const auto& b : buckets) tallest = std::max(tallest, b[0] + b[1] + b[2] + b[3]);
