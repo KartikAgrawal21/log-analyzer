@@ -379,8 +379,9 @@ bool parse_target(std::string_view target, const HttpServerOptions& limits, Http
     return true;
 }
 
-/// Validates one header line. `seen_host` / `seen_length` carry the duplicate checks.
-bool check_header_line(std::string_view line, bool& seen_host, bool& seen_length) noexcept {
+/// Validates one header line. `seen_host` / `seen_length` carry the duplicate checks; the
+/// (trimmed) value of the Host header is stored in `host` (a view into the line).
+bool check_header_line(std::string_view line, bool& seen_host, bool& seen_length, std::string_view& host) noexcept {
     const std::size_t colon = line.find(':');
     if (colon == std::string_view::npos) return false;
     const std::string_view name = line.substr(0, colon);
@@ -389,6 +390,7 @@ bool check_header_line(std::string_view line, bool& seen_host, bool& seen_length
     if (iequals(name, "host")) {
         if (seen_host) return false;
         seen_host = true;
+        host = value;
     } else if (iequals(name, "content-length")) {
         if (seen_length) return false;
         seen_length = true;
@@ -466,6 +468,26 @@ std::string error_wire(int status, bool head_only) {
 
 bool looks_like_head_request(std::string_view head) noexcept { return head.substr(0, 5) == "HEAD "; }
 
+/// Is `host` (a Host header value) one of `allowed`, optionally followed by ":port"? Case-insensitive
+/// on the name; the port, when present, must be 1-5 digits. An empty value never matches.
+bool host_allowed(const std::vector<std::string>& allowed, std::string_view host) noexcept {
+    if (host.empty()) return false;
+    std::string_view name = host;
+    const std::size_t colon = host.rfind(':');
+    if (colon != std::string_view::npos) {
+        const std::string_view port = host.substr(colon + 1);
+        if (port.empty() || port.size() > 5) return false;
+        for (const char c : port) {
+            if (c < '0' || c > '9') return false;
+        }
+        name = host.substr(0, colon);
+    }
+    for (const std::string& candidate : allowed) {
+        if (iequals(name, candidate)) return true;
+    }
+    return false;
+}
+
 /// The wire bytes answering the complete request head `head`.
 std::string make_reply(const HttpServerOptions& options, const HttpHandler& handler, std::string_view head) {
     HttpRequest request;
@@ -477,6 +499,10 @@ std::string make_reply(const HttpServerOptions& options, const HttpHandler& hand
         case ParseStatus::VersionNotSupported: return error_wire(505, looks_like_head_request(head));
     }
     const bool head_only = request.method == "HEAD";
+    // DNS-rebinding defence: refuse a Host we were not told to answer to, before any handler runs.
+    if (!options.allowed_hosts.empty() && !host_allowed(options.allowed_hosts, request.host)) {
+        return error_wire(403, head_only);
+    }
     HttpResponse response;
     try {
         response = handler(request);
@@ -644,6 +670,20 @@ void validate_options(const HttpServerOptions& o, std::uint32_t& address) {
     if (o.max_header_bytes < 1) throw std::invalid_argument("HttpServerOptions: max_header_bytes must be >= 1");
     if (o.max_target_bytes < 1) throw std::invalid_argument("HttpServerOptions: max_target_bytes must be >= 1");
     if (o.max_query_params < 1) throw std::invalid_argument("HttpServerOptions: max_query_params must be >= 1");
+    for (const std::string& host : o.allowed_hosts) {
+        // Bare names only: a request's ":port" is stripped before comparing, so an entry such as
+        // "localhost:8080" could never match and would lock every client out without a word.
+        bool ok = !host.empty();
+        for (const char c : host) {
+            const bool name_char = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                                   c == '-' || c == '.' || c == '_';
+            if (!name_char) ok = false;
+        }
+        if (!ok) {
+            throw std::invalid_argument("HttpServerOptions: allowed_hosts entries must be bare host names or IPv4 "
+                                        "literals (letters, digits, '-', '_' and '.', no port), got '" + host + "'");
+        }
+    }
 }
 
 }  // namespace
@@ -773,6 +813,7 @@ ParseStatus parse_request_head(std::string_view head, const HttpServerOptions& l
     std::size_t header_lines = 0;
     bool seen_host = false;
     bool seen_length = false;
+    std::string_view host;
     bool more = line_end != std::string_view::npos;
     std::string_view rest = more ? head.substr(line_end + 2) : std::string_view();
     while (more) {
@@ -781,8 +822,9 @@ ParseStatus parse_request_head(std::string_view head, const HttpServerOptions& l
         more = end != std::string_view::npos;
         rest = more ? rest.substr(end + 2) : std::string_view();
         if (++header_lines > kMaxHeaderLines) return ParseStatus::BadRequest;
-        if (!check_header_line(line, seen_host, seen_length)) return ParseStatus::BadRequest;
+        if (!check_header_line(line, seen_host, seen_length, host)) return ParseStatus::BadRequest;
     }
+    request.host = std::string(host);
 
     out = std::move(request);
     return ParseStatus::Ok;

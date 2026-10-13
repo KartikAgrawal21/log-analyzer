@@ -1892,3 +1892,130 @@ TEST(HttpServer, ManyConnectionsQueuedAtOnceAreAllServed) {
     }
     CHECK(wait_until([&] { return server.requests_served() >= 40; }));
 }
+
+// =============================================================================================
+// Host validation (DNS-rebinding defence)
+// =============================================================================================
+
+namespace {
+
+HttpServerOptions loopback_only_options() {
+    HttpServerOptions o = test_options();
+    o.allowed_hosts = {"localhost", "127.0.0.1"};
+    return o;
+}
+
+Reply get_with_host(std::uint16_t port, const std::string& host_line) {
+    return fetch(port, "GET /x HTTP/1.1\r\n" + host_line + "\r\n\r\n");
+}
+
+}  // namespace
+
+TEST(HostValidation, TheParserKeepsTheTrimmedHostValue) {
+    CHECK_EQ(parse_ok("GET / HTTP/1.1\r\nHost: localhost:8080").host, "localhost:8080"s);
+    CHECK_EQ(parse_ok("GET / HTTP/1.1\r\nHost:   Example.COM   ").host, "Example.COM"s);
+    CHECK_EQ(parse_ok("GET / HTTP/1.1\r\nHOST: a").host, "a"s);  // header names are case-insensitive
+    CHECK_EQ(parse_ok("GET / HTTP/1.1\r\nAccept: */*").host, ""s);
+    CHECK_EQ(parse_ok("GET / HTTP/1.1").host, ""s);
+    CHECK_EQ(parse_ok("GET / HTTP/1.1\r\nHost:").host, ""s);
+    CHECK_EQ(parse("GET / HTTP/1.1\r\nHost: a\r\nHost: b"), ParseStatus::BadRequest);  // still refused
+}
+
+TEST(HostValidation, AllowedNamesAreServedWithOrWithoutAPortAndInAnyCase) {
+    Seen seen;
+    HttpServer server(loopback_only_options());
+    server.start(recording(seen));
+    const std::uint16_t port = server.port();
+    for (const char* host : {"localhost", "LOCALHOST", "LocalHost:8080", "localhost:1", "localhost:65535",
+                             "127.0.0.1", "127.0.0.1:12345", "127.0.0.1:00080"}) {
+        const Reply r = get_with_host(port, std::string("Host: ") + host);
+        if (r.status != 200) throw testkit::Failure{std::string("Host '") + host + "' should be served, got " + std::to_string(r.status)};
+    }
+    CHECK_EQ(seen.count(), std::size_t(8));
+}
+
+TEST(HostValidation, EveryOtherHostIsRefusedBeforeTheHandlerRuns) {
+    Seen seen;
+    HttpServer server(loopback_only_options());
+    server.start(recording(seen));
+    const std::uint16_t port = server.port();
+
+    // The attacker's domain, near misses, odd port syntax and tricks that confuse substring checks.
+    for (const char* host : {"evil.example", "evil.example:8080", "localhost.evil.com", "127.0.0.1.evil.com",
+                             "evil.com#localhost", "localhost@evil.com", "evil.com/localhost", "xlocalhost",
+                             "localhos", "localhost:", "localhost:abc", "localhost:123456", "localhost:-1",
+                             "localhost:80:80", ":8080", "[::1]", "[::1]:8080", "0.0.0.0", "127.0.0.2", "127.1",
+                             "localhost evil", "localhost%00", ".", ""}) {
+        const Reply r = get_with_host(port, std::string("Host: ") + host);
+        if (r.status != 403) {
+            throw testkit::Failure{std::string("Host '") + host + "' should be refused with 403, got " + std::to_string(r.status)};
+        }
+        CHECK_EQ(r.body, "forbidden"s);
+    }
+    CHECK_EQ(seen.count(), std::size_t(0));  // no refused request ever reached the handler
+}
+
+TEST(HostValidation, ARequestWithoutAHostHeaderIsRefusedWhenTheListIsOn) {
+    Seen seen;
+    HttpServer server(loopback_only_options());
+    server.start(recording(seen));
+    CHECK_EQ(fetch(server.port(), "GET /x HTTP/1.1\r\nAccept: */*\r\n\r\n").status, 403);
+    CHECK_EQ(fetch(server.port(), "GET /x HTTP/1.0\r\n\r\n").status, 403);
+    CHECK_EQ(seen.count(), std::size_t(0));
+}
+
+TEST(HostValidation, HeadRequestsAreRefusedWithoutABody) {
+    HttpServer server(loopback_only_options());
+    server.start(echo_handler());
+    const Reply r = fetch(server.port(), "HEAD /x HTTP/1.1\r\nHost: evil.example\r\n\r\n");
+    CHECK_EQ(r.status, 403);
+    CHECK_EQ(r.body, ""s);
+    const std::string* length = r.header("Content-Length");
+    CHECK(length != nullptr);
+    CHECK_EQ(*length, "9"s);  // the length of "forbidden", as GET would report
+}
+
+TEST(HostValidation, AnEmptyListMeansEveryHostIsAccepted) {
+    Seen seen;
+    HttpServer server(test_options());  // allowed_hosts left empty
+    server.start(recording(seen));
+    CHECK_EQ(get_with_host(server.port(), "Host: evil.example").status, 200);
+    CHECK_EQ(fetch(server.port(), "GET /x HTTP/1.1\r\n\r\n").status, 200);  // not even a Host header
+    CHECK_EQ(seen.count(), std::size_t(2));
+}
+
+TEST(HostValidation, TheHandlerSeesTheHostThatWasAccepted) {
+    Seen seen;
+    HttpServer server(loopback_only_options());
+    server.start(recording(seen));
+    CHECK_EQ(get_with_host(server.port(), "Host: LocalHost:9").status, 200);
+    CHECK_EQ(seen.at(0).host, "LocalHost:9"s);
+}
+
+TEST(HostValidation, TheServerStillWorksAfterManyRefusals) {
+    Seen seen;
+    HttpServer server(loopback_only_options());
+    server.start(recording(seen));
+    for (int i = 0; i < 50; ++i) CHECK_EQ(get_with_host(server.port(), "Host: evil.example").status, 403);
+    CHECK_EQ(get_with_host(server.port(), "Host: localhost").status, 200);
+    CHECK_EQ(seen.count(), std::size_t(1));
+}
+
+TEST(HostValidation, UnusableAllowListEntriesAreRejectedWhenTheServerIsConstructed) {
+    // "localhost:8080" could never match (the request's port is stripped before comparing), so
+    // accepting it would silently lock every client out.
+    for (const char* bad : {"", "localhost:8080", "a b", "[::1]", "a/b", "a@b", "caf\xC3\xA9", "a\r\nb", "*"}) {
+        HttpServerOptions o = test_options();
+        o.allowed_hosts = {"localhost", bad};
+        bool threw = false;
+        try {
+            HttpServer server(o);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        if (!threw) throw testkit::Failure{std::string("allowed_hosts entry '") + bad + "' should be rejected"};
+    }
+    HttpServerOptions fine = test_options();
+    fine.allowed_hosts = {"localhost", "127.0.0.1", "my-box.local", "MY_BOX", "10.0.0.5"};
+    HttpServer server(fine);  // does not throw
+}

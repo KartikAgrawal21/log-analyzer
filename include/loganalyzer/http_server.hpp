@@ -31,6 +31,9 @@ struct HttpRequest {
     /// Percent-decoded key/value pairs in order of appearance; '+' decodes to a space. A pair
     /// without '=' has an empty value. Empty pairs ("a=1&&b=2") are skipped.
     std::vector<std::pair<std::string, std::string>> query;
+    /// The value of the Host header with surrounding spaces trimmed, exactly as received
+    /// ("localhost:8080"); empty when the request has no Host header.
+    std::string host;
 
     /// Pointer to the value of the LAST pair whose key equals `key` (exact, case-sensitive
     /// comparison of the decoded key), or nullptr. The pointer is valid as long as this request
@@ -86,6 +89,18 @@ struct HttpServerOptions {
     std::size_t max_header_bytes = 16384;
     std::size_t max_target_bytes = 2048;  ///< longest accepted request target (414 beyond it)
     std::size_t max_query_params = 64;    ///< most key/value pairs in one query (400 beyond it)
+    /// Defence against DNS rebinding. A web page the user visits can make their browser send
+    /// requests to http://127.0.0.1:<port>/ after its own domain is re-pointed at loopback, and
+    /// read the answers: the browser's same-origin rule no longer protects a local service. The
+    /// request still carries the attacker's domain in its Host header, so when this list is not
+    /// empty a request whose Host is not one of these names is answered 403 and never reaches the
+    /// handler. Names are bare host names or IPv4 literals without a port ("localhost",
+    /// "127.0.0.1"); matching is case-insensitive, and the request's Host may add a ":port"
+    /// (1-5 digits). A request WITHOUT a Host header is refused too (it is mandatory in
+    /// HTTP/1.1, and an attacker-controlled client can omit it). Empty (the default) switches
+    /// the check off, which is right when the server is meant to be reached by name from other
+    /// machines. parse_request_head() ignores this field: the check happens in the server.
+    std::vector<std::string> allowed_hosts;
 };
 
 /// Single-threaded-accept HTTP/1.1 server.
@@ -215,7 +230,8 @@ enum class ParseStatus {
 ///  7. Header lines (at most 100, else BadRequest): `name ":" value` where the name is a
 ///     non-empty token (so a space before the colon, a leading space and obs-fold continuation
 ///     lines are rejected) and a colon is present; the value, with surrounding spaces trimmed,
-///     is otherwise ignored, with these exceptions: a second Host header, a second
+///     is otherwise ignored (the Host value is kept in HttpRequest::host), with these
+///     exceptions: a second Host header, a second
 ///     Content-Length header, a Content-Length that is not all digits or is not zero, and any
 ///     Transfer-Encoding header are BadRequest (request-smuggling hardening; bodies are not
 ///     supported). A missing Host header is accepted.
