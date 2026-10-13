@@ -86,9 +86,16 @@ private:
             return service == other.service && signature == other.signature;
         }
     };
+    // Keyed SipHash with a random key per TopKErrors. The service and signature come from log
+    // text, so an unkeyed hash lets whoever writes the log pile every group into one bucket and
+    // make add() quadratic. The two fields are hashed one after the other, the second hash
+    // keyed by the first, so ("ab","c") and ("a","bc") do not collide systematically either.
     struct GroupKeyHash {
+        std::uint64_t key0 = 0;
+        std::uint64_t key1 = 0;
         std::size_t operator()(const GroupKey& key) const noexcept;
     };
+    static GroupKeyHash fresh_group_hash();
 
     Level min_level_;
     std::uint64_t total_ = 0;

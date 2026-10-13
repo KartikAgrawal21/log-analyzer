@@ -5,35 +5,11 @@
 #include <utility>
 
 #include "loganalyzer/error_signature.hpp"
+#include "loganalyzer/keyed_hash.hpp"
 #include "loganalyzer/min_heap.hpp"
 
 namespace loganalyzer {
 namespace {
-
-// 64-bit FNV-1a: byte-wise, so it is independent of char signedness.
-std::uint64_t fnv1a(std::string_view s) noexcept {
-    std::uint64_t h = 14695981039346656037ULL;
-    for (char c : s) {
-        h ^= static_cast<unsigned char>(c);
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-// boost::hash_combine widened to 64 bits. Order-sensitive, so (service, signature)
-// and (signature, service) hash differently.
-std::uint64_t hash_combine(std::uint64_t seed, std::uint64_t h) noexcept {
-    return seed ^ (h + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
-}
-
-// MurmurHash3 finalizer: unordered_map implementations that mask the low bits
-// (MSVC) would otherwise see FNV's weakest bits.
-std::uint64_t avalanche(std::uint64_t x) noexcept {
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    return x;
-}
 
 // `a` ranks strictly before `b`: higher count first, then signature, then service
 // ascending. (service, signature) is unique per group, so this is a strict total order.
@@ -54,11 +30,22 @@ struct RanksAfter {
 }  // namespace
 
 std::size_t TopKErrors::GroupKeyHash::operator()(const GroupKey& key) const noexcept {
-    const std::uint64_t h = hash_combine(fnv1a(key.service), fnv1a(key.signature));
-    return static_cast<std::size_t>(avalanche(h));
+    const std::uint64_t first = detail::siphash24(key0, key1, key.service.data(), key.service.size());
+    // Chain: the signature is hashed under a key that depends on the service hash, so equal
+    // signatures in different services (and shifted splits of the same bytes) hash apart.
+    return static_cast<std::size_t>(
+        detail::siphash24(key0 ^ first, key1, key.signature.data(), key.signature.size()));
 }
 
-TopKErrors::TopKErrors(Level min_level) : min_level_(min_level) {}
+TopKErrors::GroupKeyHash TopKErrors::fresh_group_hash() {
+    const detail::HashKeys keys = detail::fresh_hash_keys();
+    GroupKeyHash hash;
+    hash.key0 = keys.key0;
+    hash.key1 = keys.key1;
+    return hash;
+}
+
+TopKErrors::TopKErrors(Level min_level) : min_level_(min_level), index_(0, fresh_group_hash()) {}
 
 void TopKErrors::add(const LogEntry& entry) {
     if (entry.level < min_level_) return;

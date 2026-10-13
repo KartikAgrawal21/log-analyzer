@@ -4,12 +4,14 @@
 #include <limits>
 #include <map>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "loganalyzer/error_signature.hpp"
+#include "loganalyzer/keyed_hash.hpp"
 #include "loganalyzer/level.hpp"
 #include "loganalyzer/log_entry.hpp"
 #include "loganalyzer/top_k_errors.hpp"
@@ -572,4 +574,64 @@ TEST(TopKErrors, MovedFromObjectIsEmptyAndReusable) {
     CHECK_EQ(c.total(), std::uint64_t{2});
     CHECK_EQ(b.total(), std::uint64_t{0});
     CHECK_EQ(b.distinct(), std::size_t{0});
+}
+
+// ---- keyed hash (log text is attacker-controlled) -----------------------------------------
+
+TEST(TopKErrors, EveryFreshHashKeyIsDifferent) {
+    // Each TopKErrors draws its own key, so nobody can precompute colliding groups for it.
+    std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
+    for (int i = 0; i < 2000; ++i) {
+        const loganalyzer::detail::HashKeys keys = loganalyzer::detail::fresh_hash_keys();
+        CHECK(seen.insert({keys.key0, keys.key1}).second);
+    }
+}
+
+TEST(TopKErrors, ResultsDoNotDependOnTheRandomHashKey) {
+    // Two instances get different keys, hence different bucket layouts, but identical answers.
+    std::mt19937 rng(7);
+    std::vector<LogEntry> entries;
+    for (int i = 0; i < 6000; ++i) {
+        entries.push_back(err(static_cast<std::int64_t>(i), "svc-" + std::to_string(rng() % 7),
+                              "Failed to reach host " + std::to_string(rng() % 40) + " after " +
+                                  std::to_string(rng()) + "ms (variant " + std::to_string(rng() % 13) + ")"));
+    }
+    TopKErrors a;
+    TopKErrors b;
+    for (const LogEntry& e : entries) a.add(e);
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it) b.add(*it);  // opposite insertion order too
+    CHECK_EQ(a.total(), b.total());
+    CHECK_EQ(a.distinct(), b.distinct());
+    const std::vector<SignatureCount> ta = a.top_k(a.distinct());
+    const std::vector<SignatureCount> tb = b.top_k(b.distinct());
+    CHECK_EQ(ta.size(), tb.size());
+    for (std::size_t i = 0; i < ta.size(); ++i) {
+        CHECK_EQ(ta[i].service, tb[i].service);
+        CHECK_EQ(ta[i].signature, tb[i].signature);
+        CHECK_EQ(ta[i].count, tb[i].count);
+    }
+}
+
+TEST(TopKErrors, SplitsOfTheSameBytesAreDifferentGroups) {
+    // ("ab","c") and ("a","bc") concatenate to the same bytes; the keyed chain keeps them apart.
+    TopKErrors counter;
+    counter.add(err(1, "ab", "c"));
+    counter.add(err(2, "a", "bc"));
+    counter.add(err(3, "ab", "c"));
+    CHECK_EQ(counter.distinct(), std::size_t{2});
+    const std::vector<SignatureCount> top = counter.top_k(2);
+    CHECK_EQ(top[0].service, std::string("ab"));
+    CHECK_EQ(top[0].count, std::uint64_t{2});
+    CHECK_EQ(top[1].service, std::string("a"));
+}
+
+TEST(TopKErrors, CopiesKeepTheirOwnCountsAndStillHashConsistently) {
+    TopKErrors original;
+    for (int i = 0; i < 300; ++i) original.add(err(i, "s", "boom " + std::to_string(i % 11)));
+    TopKErrors copy = original;
+    copy.add(err(1000, "s", "boom 3"));  // an existing group in the copy
+    CHECK_EQ(copy.total(), original.total() + 1);
+    CHECK_EQ(copy.distinct(), original.distinct());
+    original.add(err(1001, "s", "brand new"));
+    CHECK_EQ(original.distinct(), copy.distinct() + 1);
 }
