@@ -13,8 +13,15 @@ endif()
 file(GLOB_RECURSE LIB_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.cpp)
 file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/*.cpp)
 
+find_package(Threads REQUIRED)
+
 add_library(loganalyzer_lib STATIC ${LIB_SOURCES})
 target_include_directories(loganalyzer_lib PUBLIC ${CMAKE_SOURCE_DIR}/include)
+# The HTTP server (serve command) runs on its own thread and, on Windows, uses Winsock.
+target_link_libraries(loganalyzer_lib PUBLIC Threads::Threads)
+if(WIN32)
+  target_link_libraries(loganalyzer_lib PUBLIC ws2_32)
+endif()
 
 add_executable(loganalyzer app/main.cpp)
 target_link_libraries(loganalyzer PRIVATE loganalyzer_lib)
