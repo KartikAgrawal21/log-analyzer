@@ -84,6 +84,32 @@ void* operator new(std::size_t size) {
 #endif
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+
+// The complete family, not just the two above. Replacing only some leaves the others on the
+// library's own allocator, and memory from one family is then freed by the other: under
+// AddressSanitizer std::stable_sort's temporary buffer (operator new(size, nothrow), served by
+// ASan) reached the free() above and aborted the run as an alloc-dealloc mismatch. Every
+// variant counts, honours the failure injection, and pairs malloc with free. (Over-aligned
+// variants are not replaced: nothing in these tests allocates over-aligned types.)
+void* operator new[](std::size_t size) { return operator new(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
