@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -26,6 +27,7 @@
 
 #include "loganalyzer/alert_engine.hpp"
 #include "loganalyzer/error_signature.hpp"
+#include "loganalyzer/http_server.hpp"
 #include "loganalyzer/hyperloglog.hpp"
 #include "loganalyzer/inverted_index.hpp"
 #include "loganalyzer/kmp.hpp"
@@ -35,6 +37,7 @@
 #include "loganalyzer/log_merger.hpp"
 #include "loganalyzer/log_parser.hpp"
 #include "loganalyzer/report.hpp"
+#include "loganalyzer/serve.hpp"
 #include "loganalyzer/sketch_top_k.hpp"
 #include "loganalyzer/top_k_errors.hpp"
 #include "loganalyzer/trie.hpp"
@@ -75,6 +78,12 @@ Usage:
   loganalyzer report FILE... [--out report.html] [--title T] [--top N] [--buckets N] [--rule SPEC ...] [--rules-file F]
       One self-contained HTML dashboard (no scripts, no network): summary, levels, services,
       timeline, top error signatures and, with rules, the alerts they fire. Stdout without --out.
+  loganalyzer serve FILE... [--port 8080] [--bind 127.0.0.1] [--title T] [--rule SPEC ...] [--rules-file F]
+                            [--allow-host NAME ...] [--max-requests N]
+      Live dashboard over HTTP: the HTML report at / and a JSON API (/api/summary, /api/top-errors,
+      /api/search?q=, /api/complete?prefix=, /api/alerts, /healthz). Loopback only by default; the
+      Host header is checked (DNS-rebinding defence). --port 0 picks a free port; --max-requests
+      stops after N requests (for scripts). Press Ctrl+C to stop.
   loganalyzer grep PATTERN FILE... [--ignore-case] [--level LEVEL] [--service NAME] [--max N] [--count]
       Entries whose message contains PATTERN (KMP substring search); --level is a minimum.
   loganalyzer search QUERY FILE... [--limit N] [--count]
@@ -757,6 +766,57 @@ int cmd_complete(const std::vector<std::string>& args, std::ostream& out, std::o
     return kOk;
 }
 
+/// Builds an AlertEngine from the repeatable --rule options and an optional --rules-file.
+AlertEngine alert_engine_from(const ParsedArgs& parsed) {
+    AlertEngine engine;
+    for (const std::string& spec : parsed.all("--rule")) {
+        try {
+            engine.add_rule(parse_rule_spec(spec));
+        } catch (const std::invalid_argument& e) {
+            throw UsageError("bad --rule '" + spec + "': " + e.what());
+        }
+    }
+    if (parsed.has("--rules-file")) load_rules_file(parsed.options.at("--rules-file"), engine);
+    return engine;
+}
+
+/// Everything `report` and `serve` need from the input files: the entries, and the alerts the
+/// rules fire on them.
+struct LoadedLogs {
+    std::vector<LogEntry> entries;
+    std::vector<Alert> alerts;
+    std::size_t malformed = 0;
+};
+
+/// Reads the files. With rules, the files must each be time-sorted: they are k-way merged and
+/// replayed through the engine, so `entries` comes out time-ordered. Without rules the entries
+/// are simply concatenated in file order.
+LoadedLogs load_logs(const std::vector<std::string>& files, AlertEngine& engine) {
+    LoadedLogs logs;
+    std::vector<std::vector<LogEntry>> sources;
+    sources.reserve(files.size());
+    for (const std::string& path : files) {
+        sources.push_back(load_file(path, logs.malformed));
+        if (engine.rule_count() != 0) require_sorted(path, sources.back());  // rules need a time-ordered stream
+    }
+
+    if (engine.rule_count() != 0) {
+        KWayMerger merger(std::move(sources));
+        logs.entries.reserve(merger.remaining());
+        while (merger.has_next()) {
+            logs.entries.push_back(merger.next());
+            for (Alert& alert : engine.process(logs.entries.back())) logs.alerts.push_back(std::move(alert));
+            if ((logs.entries.size() & 0xFFF) == 0) engine.expire_idle(logs.entries.back().timestamp_ms);
+        }
+    } else {
+        for (std::vector<LogEntry>& source : sources) {
+            logs.entries.insert(logs.entries.end(), std::make_move_iterator(source.begin()),
+                                std::make_move_iterator(source.end()));
+        }
+    }
+    return logs;
+}
+
 int cmd_report(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
     const ParsedArgs parsed = parse_args(args, {"--out", "--title", "--top", "--buckets", "--rules-file"}, {"--rule"});
     if (parsed.positional.empty()) throw UsageError("report needs at least one FILE");
@@ -767,39 +827,11 @@ int cmd_report(const std::vector<std::string>& args, std::ostream& out, std::ost
     options.top_k = static_cast<std::size_t>(uint_option(parsed, "--top", options.top_k, 1, 1000));
     options.time_buckets = static_cast<std::size_t>(uint_option(parsed, "--buckets", options.time_buckets, 1, 400));
 
-    AlertEngine engine;
-    for (const std::string& spec : parsed.all("--rule")) {
-        try {
-            engine.add_rule(parse_rule_spec(spec));
-        } catch (const std::invalid_argument& e) {
-            throw UsageError("bad --rule '" + spec + "': " + e.what());
-        }
-    }
-    if (parsed.has("--rules-file")) load_rules_file(parsed.options.at("--rules-file"), engine);
-
-    std::size_t malformed = 0;
-    std::vector<std::vector<LogEntry>> sources;
-    sources.reserve(files.size());
-    for (const std::string& path : files) {
-        sources.push_back(load_file(path, malformed));
-        if (engine.rule_count() != 0) require_sorted(path, sources.back());  // rules need a time-ordered stream
-    }
-
-    std::vector<LogEntry> entries;
-    std::vector<Alert> alerts;
-    if (engine.rule_count() != 0) {
-        KWayMerger merger(std::move(sources));
-        entries.reserve(merger.remaining());
-        while (merger.has_next()) {
-            entries.push_back(merger.next());
-            for (Alert& alert : engine.process(entries.back())) alerts.push_back(std::move(alert));
-            if ((entries.size() & 0xFFF) == 0) engine.expire_idle(entries.back().timestamp_ms);
-        }
-    } else {
-        for (std::vector<LogEntry>& source : sources) {
-            entries.insert(entries.end(), std::make_move_iterator(source.begin()), std::make_move_iterator(source.end()));
-        }
-    }
+    AlertEngine engine = alert_engine_from(parsed);
+    const LoadedLogs logs = load_logs(files, engine);
+    const std::vector<LogEntry>& entries = logs.entries;
+    const std::vector<Alert>& alerts = logs.alerts;
+    const std::size_t malformed = logs.malformed;
 
     const std::string html = render_html_report(entries, alerts, options);
     if (parsed.has("--out")) {
@@ -818,6 +850,69 @@ int cmd_report(const std::vector<std::string>& args, std::ostream& out, std::ost
         << " malformed lines skipped";
     if (parsed.has("--out")) err << " -> " << parsed.options.at("--out");
     err << "\n";
+    return kOk;
+}
+
+/// "127.x.y.z": the whole 127.0.0.0/8 block is loopback.
+bool is_loopback_address(const std::string& address) { return address.compare(0, 4, "127.") == 0; }
+
+int cmd_serve(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    const ParsedArgs parsed = parse_args(
+        args, {"--port", "--bind", "--title", "--top", "--buckets", "--rules-file", "--max-requests"},
+        {"--rule", "--allow-host"});
+    if (parsed.positional.empty()) throw UsageError("serve needs at least one FILE");
+    const std::vector<std::string> files = expand_inputs(parsed.positional);
+
+    ServeOptions options;
+    options.title = parsed.has("--title") ? parsed.options.at("--title") : std::string("Log dashboard");
+    options.top_k = static_cast<std::size_t>(uint_option(parsed, "--top", options.top_k, 1, 1000));
+    options.time_buckets = static_cast<std::size_t>(uint_option(parsed, "--buckets", options.time_buckets, 1, 400));
+
+    HttpServerOptions server_options;
+    server_options.bind_address = parsed.has("--bind") ? parsed.options.at("--bind") : std::string("127.0.0.1");
+    server_options.port = static_cast<std::uint16_t>(uint_option(parsed, "--port", 8080, 0, 65535));
+    const std::uint64_t max_requests = uint_option(parsed, "--max-requests", 0, 1, 1'000'000'000);  // 0 = no limit
+
+    // DNS-rebinding defence: on loopback only the names that reach this machine are answered.
+    // On any other address the operator must say which names are expected (--allow-host), or the
+    // check stays off, with a warning.
+    std::vector<std::string> hosts = parsed.all("--allow-host");
+    if (is_loopback_address(server_options.bind_address)) {
+        for (const std::string& name : {std::string("localhost"), std::string("127.0.0.1"), server_options.bind_address}) {
+            if (std::find(hosts.begin(), hosts.end(), name) == hosts.end()) hosts.push_back(name);
+        }
+    }
+    server_options.allowed_hosts = hosts;
+
+    AlertEngine engine = alert_engine_from(parsed);
+    LoadedLogs logs = load_logs(files, engine);
+    const std::size_t entry_count = logs.entries.size();
+    const std::size_t malformed = logs.malformed;
+    // DashboardService is move-only; the handler (a std::function) must be copyable.
+    auto service = std::make_shared<DashboardService>(std::move(logs.entries), std::move(logs.alerts), options);
+
+    std::unique_ptr<HttpServer> server;
+    try {
+        server = std::make_unique<HttpServer>(server_options);
+    } catch (const std::invalid_argument& e) {
+        throw UsageError(e.what());
+    }
+    server->start([service](const HttpRequest& request) { return service->handle(request); });
+
+    out << "serving " << entry_count << " entries on http://" << server_options.bind_address << ":" << server->port()
+        << "/ (press Ctrl+C to stop)" << std::endl;
+    if (server_options.allowed_hosts.empty()) {
+        err << "warning: bound to " << server_options.bind_address
+            << " without Host header checking; pass --allow-host NAME (repeatable) to answer only the names "
+               "you expect\n";
+    }
+    if (malformed != 0) err << malformed << " malformed lines skipped\n";
+
+    while (server->running() && (max_requests == 0 || server->requests_served() < max_requests)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    server->stop();
+    err << "served " << server->requests_served() << " requests\n";
     return kOk;
 }
 
@@ -1044,6 +1139,7 @@ int run_cli(const std::vector<std::string>& args, std::ostream& out, std::ostrea
         if (command == "top-errors") return cmd_top_errors(args, out);
         if (command == "alerts") return cmd_alerts(args, out, err);
         if (command == "report") return cmd_report(args, out, err);
+        if (command == "serve") return cmd_serve(args, out, err);
         if (command == "grep") return cmd_grep(args, out, err);
         if (command == "search") return cmd_search(args, out, err);
         if (command == "complete") return cmd_complete(args, out, err);

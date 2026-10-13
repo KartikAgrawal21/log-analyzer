@@ -4,11 +4,34 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <ostream>
 #include <sstream>
 #include <streambuf>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifdef _WIN32
+// windows.h (pulled in by winsock2.h) defines min/max macros that break std::numeric_limits<T>::max().
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
 
 #include "loganalyzer/alert_engine.hpp"
 #include "loganalyzer/cli.hpp"
@@ -900,4 +923,186 @@ TEST(Cli, BenchReportsSketchAndHyperLogLogAccuracy) {
     CHECK(r.out.find(" KiB agrees with the exact top-10 on ") != std::string::npos);
     CHECK(r.out.find("HyperLogLog check:") != std::string::npos);
     CHECK(r.out.find("exact ") != std::string::npos);
+}
+
+// ---- Week 4: serve ----------------------------------------------------------------------
+
+namespace {
+
+/// An output sink the test thread can read while the serve thread is still writing to it.
+class SharedSink : public std::streambuf {
+public:
+    std::string text() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return text_;
+    }
+
+protected:
+    int_type overflow(int_type c) override {
+        if (c != traits_type::eof()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            text_.push_back(static_cast<char>(c));
+        }
+        return traits_type::not_eof(c);
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        text_.append(s, static_cast<std::size_t>(n));
+        return n;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::string text_;
+};
+
+#ifdef _WIN32
+using socket_handle = SOCKET;
+const socket_handle kBadSocket = INVALID_SOCKET;
+void close_socket(socket_handle s) { ::closesocket(s); }
+#else
+using socket_handle = int;
+const socket_handle kBadSocket = -1;
+void close_socket(socket_handle s) { ::close(s); }
+#endif
+
+/// One blocking HTTP exchange with 127.0.0.1:port: send `request`, read until the server closes.
+std::string http_exchange(std::uint16_t port, const std::string& request) {
+#ifdef _WIN32
+    static const bool winsock_ready = [] {
+        WSADATA data;
+        return ::WSAStartup(MAKEWORD(2, 2), &data) == 0;
+    }();
+    if (!winsock_ready) throw testkit::Failure{"WSAStartup failed"};
+#endif
+    socket_handle s = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (s == kBadSocket) throw testkit::Failure{"cannot create a client socket"};
+#ifdef _WIN32
+    const DWORD timeout = 5000;
+    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof timeout);
+#else
+    timeval timeout{};
+    timeout.tv_sec = 5;
+    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+#endif
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    if (::connect(s, reinterpret_cast<const sockaddr*>(&address), sizeof address) != 0) {
+        close_socket(s);
+        throw testkit::Failure{"cannot connect to the serve command"};
+    }
+    std::size_t sent = 0;
+    while (sent < request.size()) {
+        const auto n = ::send(s, request.data() + sent, static_cast<int>(request.size() - sent), 0);
+        if (n <= 0) break;
+        sent += static_cast<std::size_t>(n);
+    }
+    std::string reply;
+    char buffer[4096];
+    while (true) {
+        const auto n = ::recv(s, buffer, static_cast<int>(sizeof buffer), 0);
+        if (n <= 0) break;
+        reply.append(buffer, static_cast<std::size_t>(n));
+    }
+    close_socket(s);
+    return reply;
+}
+
+std::string get_request(const std::string& target, const std::string& host) {
+    return "GET " + target + " HTTP/1.1\r\nHost: " + host + "\r\n\r\n";
+}
+
+}  // namespace
+
+TEST(Cli, ServeAnswersRealHttpRequestsAndStopsAfterMaxRequests) {
+    TempDir dir("serve");
+    write_text(dir.file("a.log"), kSearchLog);
+
+    SharedSink out_sink, err_sink;
+    std::ostream out(&out_sink), err(&err_sink);
+    int code = -1;
+    std::thread server([&] {
+        code = run_cli({"serve", dir.file("a.log"), "--port", "0", "--max-requests", "5"}, out, err);
+    });
+
+    // The banner "serving N entries on http://127.0.0.1:PORT/" appears once the socket is listening.
+    std::uint16_t port = 0;
+    for (int attempt = 0; attempt < 400 && port == 0; ++attempt) {
+        const std::string text = out_sink.text();
+        const std::string marker = "http://127.0.0.1:";
+        const std::size_t at = text.find(marker);
+        if (at != std::string::npos && text.find('/', at + marker.size()) != std::string::npos) {
+            port = static_cast<std::uint16_t>(std::stoul(text.substr(at + marker.size())));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    if (port == 0) {
+        server.join();
+        throw testkit::Failure{"serve did not start: " + err_sink.text()};
+    }
+
+    int exchanges = 0;
+    try {
+        const std::string host = "127.0.0.1:" + std::to_string(port);
+
+        const std::string health = http_exchange(port, get_request("/healthz", host));
+        ++exchanges;
+        CHECK(health.find("HTTP/1.1 200 OK") == 0);
+        CHECK(health.size() >= 2 && health.compare(health.size() - 2, 2, "ok") == 0);
+
+        const std::string summary = http_exchange(port, get_request("/api/summary", "localhost:" + std::to_string(port)));
+        ++exchanges;
+        CHECK(summary.find("HTTP/1.1 200 OK") == 0);
+        CHECK(summary.find("\"entries\":5,") != std::string::npos);
+        CHECK(summary.find("application/json") != std::string::npos);
+
+        const std::string search = http_exchange(port, get_request("/api/search?q=refused&limit=5", host));
+        ++exchanges;
+        CHECK(search.find("\"matches\":2,") != std::string::npos);
+
+        const std::string page = http_exchange(port, get_request("/", host));
+        ++exchanges;
+        CHECK(page.find("text/html") != std::string::npos);
+        CHECK(page.find("Content-Security-Policy") != std::string::npos);
+
+        // DNS rebinding: a request that names a host other than this machine is refused.
+        const std::string rebound = http_exchange(port, get_request("/api/summary", "evil.example"));
+        ++exchanges;
+        CHECK(rebound.find("HTTP/1.1 403 Forbidden") == 0);
+        CHECK(rebound.find("\"entries\"") == std::string::npos);  // none of the data leaked
+    } catch (...) {
+        // Let the server reach --max-requests so the thread ends, then report the failure.
+        for (; exchanges < 5; ++exchanges) {
+            try {
+                http_exchange(port, get_request("/healthz", "localhost"));
+            } catch (...) {
+            }
+        }
+        server.join();
+        throw;
+    }
+
+    server.join();
+    CHECK_EQ(code, 0);
+    CHECK(err_sink.text().find("served 5 requests") != std::string::npos);
+    CHECK(out_sink.text().find("serving 5 entries on http://127.0.0.1:") != std::string::npos);
+}
+
+TEST(Cli, ServeUsageAndStartupErrors) {
+    TempDir dir("serve_errors");
+    write_text(dir.file("a.log"), kSearchLog);
+    const std::string f = dir.file("a.log");
+    CHECK_EQ(run({"serve"}).code, 2);                                            // no file
+    CHECK_EQ(run({"serve", f, "--port", "70000"}).code, 2);                      // not a port
+    CHECK_EQ(run({"serve", f, "--port", "abc"}).code, 2);
+    CHECK_EQ(run({"serve", f, "--bind", "not-an-ip"}).code, 2);                  // rejected by the server's options
+    CHECK_EQ(run({"serve", f, "--max-requests", "0"}).code, 2);
+    CHECK_EQ(run({"serve", f, "--allow-host", "localhost:8080"}).code, 2);       // a port can never match
+    CHECK_EQ(run({"serve", f, "--rule", "name=x"}).code, 2);                     // incomplete rule
+    CHECK_EQ(run({"serve", dir.file("missing.log")}).code, 1);
+    Result bad_bind = run({"serve", f, "--bind", "not-an-ip"});
+    CHECK(bad_bind.err.find("bind_address") != std::string::npos);
 }
