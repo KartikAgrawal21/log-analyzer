@@ -14,6 +14,7 @@ on a problem every backend team actually has.
 | 3 ✅ | Search: prefix autocomplete, keyword search, multi-keyword queries | trie, KMP, inverted index |
 | 4 ✅ | CLI polish, dashboard / HTTP API | hardened HTTP server on raw sockets, JSON API |
 | 5 ✅ | Probabilistic structures + benchmarks on 1M logs | Count-Min Sketch, HyperLogLog |
+| 6 ✅ | Live mode: follow growing log files (`alerts --follow`, `serve --follow`), CI on Linux + Windows, sanitizer builds | offset + fingerprint tracking for rotation/truncation, incremental line assembly, bounded polling |
 
 ## Log format
 
@@ -24,7 +25,8 @@ on a problem every backend team actually has.
 
 ## Build & test
 
-Requires CMake >= 3.16 and a C++17 compiler (developed with MSVC 2019 Build Tools).
+Requires CMake >= 3.16 and a C++17 compiler (developed with MSVC 2019 Build Tools; also built and tested with
+GCC 15.2 on Linux).
 
 ```powershell
 ./build.ps1                  # Release build + run all tests (Windows)
@@ -41,7 +43,10 @@ cmake --build build
 
 Wall-clock performance assertions are opt-in because timing ratios are flaky on a busy
 machine: set `LOGANALYZER_PERF_TESTS=1` to include them. `tools/quick.ps1 ... -Asan` runs a
-subset under AddressSanitizer.
+subset under AddressSanitizer (MSVC); with GCC or Clang, `-DLOGANALYZER_SANITIZE=ON` builds everything with
+AddressSanitizer + UndefinedBehaviorSanitizer. The whole suite (774 tests on Linux, 773 on Windows, which skips the
+FIFO test) passes both ways, with no warnings under `-Wall -Wextra -Wpedantic` or MSVC `/W4`.
+`.github/workflows/ci.yml` runs Linux (GCC), Linux (sanitizers) and Windows (MSVC) on every push.
 
 ## Usage
 
@@ -50,12 +55,15 @@ loganalyzer generate --out-dir DIR [--count N] [--seed S] [--services a,b,c]
 loganalyzer merge FILE... [--out FILE]
 loganalyzer top-errors FILE... [--k N] [--min-level LEVEL]
 loganalyzer alerts FILE... --rule SPEC [--rule SPEC ...] [--rules-file FILE]
+                 [--follow [--from-end] [--poll-ms 250] [--max-alerts N] [--max-seconds N]]
 loganalyzer report FILE... [--out report.html] [--title T] [--top N] [--buckets N] [--rule SPEC ...] [--rules-file F]
 loganalyzer serve FILE... [--port 8080] [--bind 127.0.0.1] [--rule SPEC ...] [--allow-host NAME ...] [--max-requests N]
+                 [--follow [--refresh-ms 1000]]
 loganalyzer grep PATTERN FILE... [--ignore-case] [--level LEVEL] [--service NAME] [--max N] [--count]
 loganalyzer search QUERY FILE... [--limit N] [--count]
 loganalyzer complete FILE... [--prefix P] [--field signature|service|word] [--k N] [--min-level LEVEL]
 loganalyzer bench [--count N]
+loganalyzer --version
 ```
 
 ### Dashboard
@@ -199,6 +207,39 @@ RANK  COUNT  SERVICE               SIGNATURE
 Thousands of distinct concrete messages (different order ids, IPs, status codes) collapse into
 50 signature groups: 10 error templates x 5 services, exactly what the generator emits.
 
+### Live mode: following growing files
+
+`alerts --follow` and `serve --follow` keep reading the files as they grow (like `tail -f`), so rules fire and the
+dashboard updates while the services are still writing:
+
+```
+$ loganalyzer alerts app.log --rule name=burst,threshold=3,window=10s --follow
+following 1 file with 1 rule (press Ctrl+C to stop)
+2026-10-10T00:00:03.000Z ALERT rule=burst service=* count=3 since=2026-10-10T00:00:01.000Z suppressed=0
+^C
+processed 4 entries with 1 rules: 1 alerts (0 malformed lines skipped, 0 late entries ignored, 0 file rotations seen)
+```
+
+- By default what is already in the files is replayed first; `--from-end` skips it and reacts only to new lines
+  (`tail -f -n 0`). Files that do not exist yet are fine and are read from their first byte once they appear.
+- Ctrl+C stops cleanly and still prints the summary. `--max-alerts N` and `--max-seconds N` end the run on their own,
+  which is what scripts and tests use. `--poll-ms` (10..60000, default 250) is the polling interval: it is polling, not
+  inotify, so that is also the worst-case latency.
+- `serve --follow` polls when a request arrives and at least `--refresh-ms` (default 1000) have passed since the last
+  look, then swaps in a freshly built dashboard, so a quiet server reads nothing. Every refresh is O(entries) and all
+  entries stay in memory.
+- Files grow independently, so there is no global order: each poll's batch is sorted by timestamp and replayed in that
+  order. A line older than what its rule's window has already seen is counted as a late entry, not mis-ordered.
+
+The tailing is `FileFollower` (`file_follower.hpp`), a class of its own with a documented contract. Each poll opens the
+file, seeks to the remembered offset, reads what is new and closes it, so it holds no handle between polls. A line is
+delivered once its `\n` has arrived, never half-written, however the writer's bytes are split (the tests cut generated
+logs at random offsets, between `\r` and `\n`, inside a BOM and mid-timestamp, and compare with `parse_stream` over the
+whole file). It recognises a rotated or truncated file by comparing the file with an offset and a fingerprint of its
+first 256 bytes, forgets a deleted file and reads its replacement from the start, caps the bytes consumed per file per poll and the
+length of a line it will hold (an over-long line is dropped and counted once), and only ever opens regular files, because
+opening a FIFO would block. A failed allocation inside a poll leaves it unchanged.
+
 ### Approximate counting in fixed memory
 
 An exact Top-K keeps one counter per distinct group, and an exact distinct count keeps every value. When the number of
@@ -264,6 +305,7 @@ Accuracy of the fixed-memory structures on the same run:
 | Count-Min Sketch | `count_min_sketch.hpp` | depth x width counter table, double-hashing row positions from one 64-bit hash, conservative update, never undercounts, mergeable, epsilon/delta sizing |
 | Sketch Top-K | `sketch_top_k.hpp` | Count-Min Sketch plus a size-k candidate set with a lazy-deletion MinHeap (stale entries skipped, heap compacted at 2k): bounded memory regardless of the number of distinct keys |
 | HyperLogLog | `hyperloglog.hpp` | 2^p one-byte registers, leading-zero rank, harmonic-mean estimator with small-range linear counting, mergeable |
+| File follower | `file_follower.hpp` | per-file offset + 256-byte fingerprint (truncation, replacement, deletion), partial-line buffer that is extended in place, bounded polls with a backlog flag, commit-at-the-end state so `bad_alloc` cannot lose or repeat an entry |
 | Glob matcher | `wildcard.hpp` | two-pointer `*` / `?` matching with last-star backtracking (no recursion, no exponential blow-up) |
 | Parser | `log_parser.hpp` | Hinnant days-from-civil calendar math, string_view slicing, block-based stream reading |
 | Generator | `log_generator.hpp` | xoshiro256** PRNG, Zipf-weighted template choice, exact-integer level thresholds |
@@ -275,14 +317,21 @@ Accuracy of the fixed-memory structures on the same run:
   caches cost up to 4 bytes x K per node.
 - Inverted index: about 150 bytes per distinct term, and numeric ids are tokens too, so a log with millions of
   unique ids indexes millions of terms (the 100k demo above has 193,916). `search` loads all input into memory.
-- Search commands read whole files, like `alerts`; they are batch tools, not tail-followers.
-
+- `grep`, `search`, `complete`, `top-errors`, `report` and the plain `alerts` are batch tools: they read whole files.
+  Only `alerts --follow` and `serve --follow` tail.
+- Live mode: a final line that never gets a newline is never delivered (it cannot be told from a line still being
+  written), so follow files whose writer terminates every line. A file replaced by one whose first 256 bytes are
+  identical and that grows past the old offset looks like an append (documented in `file_follower.hpp`; log lines start
+  with a timestamp, so it takes a writer that rewrites identical headers). On Windows a rename or delete of a followed
+  file by another program that lands while a poll has it open fails with a sharing violation, and the writer has to
+  retry (the window is one read of at most 16 MiB; `alerts --follow` reads at most 1 MiB per file per poll).
 - The alert engine keeps one timestamp per entry inside each window, and frees quiet per-service windows only when asked
   (`AlertEngine::expire_idle`, which the `alerts` and `report` commands call every 4096 entries). Service filters are
   case-sensitive, and a rule that matches nothing is silent.
-- `alerts` loads all input before replaying it (it needs the k-way merge), so it is a batch tool, not a tail-follower yet.
-- `serve` is a snapshot server: it loads the files once at startup (no tailing, no reload), answers one connection at a
-  time, and has no TLS or authentication. It is meant for a developer's own machine; keep it on loopback.
+- Without `--follow`, `alerts` loads all input before replaying it (it needs the k-way merge). With it, entries are
+  handled in arrival order, so an entry that shows up more than one poll after a newer one from another file counts as late.
+- `serve` answers one connection at a time and has no TLS or authentication. It is meant for a developer's own machine;
+  keep it on loopback. Without `--follow` it is a snapshot of the files at startup.
 - `serve` memory: the lazily built autocomplete tries cost about 35 bytes per byte of distinct key text and are evicted
   least-recently-used above a 256 MiB estimate (a single trie can exceed it), the per-level Top-K tables are not under
   that budget, and a cache build that fails with `bad_alloc` is retried by the next request. The pre-rendered report and
@@ -294,6 +343,8 @@ Accuracy of the fixed-memory structures on the same run:
 include/loganalyzer/   public headers (header-only data structures live here)
 src/                   library implementation (globbed by CMake)
 app/main.cpp           the `loganalyzer` executable (thin wrapper over run_cli)
-tests/                 dependency-free tests (tests/testkit.hpp), globbed by CMake
+tests/                 dependency-free tests (tests/testkit.hpp), globbed by CMake; tests/alloc_probe.* is the one
+                       replacement of operator new that counts bytes and injects std::bad_alloc
 tools/quick.ps1        compile + run a subset of tests in an isolated temp dir (optional -Asan)
+.github/workflows/     CI: Linux GCC, Linux GCC + ASan/UBSan, Windows MSVC
 ```
