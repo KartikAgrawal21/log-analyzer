@@ -16,4 +16,13 @@ namespace loganalyzer {
 /// Commands: generate, merge, top-errors, bench, help. See `loganalyzer help`.
 int run_cli(const std::vector<std::string>& args, std::ostream& out, std::ostream& err);
 
+/// Asks a running `serve` or `alerts --follow` command to stop and print its summary, exactly as
+/// Ctrl+C does. Callable from any thread. Each of those commands clears an earlier request when
+/// it starts, so a call made while no such command is running is ignored; call it after the
+/// command has announced itself ("serving ..." on `out`, "following ..." on `err`).
+void request_shutdown() noexcept;
+
+/// The program's version, as printed by `loganalyzer --version`.
+const char* version_string() noexcept;
+
 }  // namespace loganalyzer

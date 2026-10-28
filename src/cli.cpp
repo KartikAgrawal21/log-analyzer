@@ -1,7 +1,9 @@
 #include "loganalyzer/cli.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -27,6 +29,7 @@
 
 #include "loganalyzer/alert_engine.hpp"
 #include "loganalyzer/error_signature.hpp"
+#include "loganalyzer/file_follower.hpp"
 #include "loganalyzer/http_server.hpp"
 #include "loganalyzer/hyperloglog.hpp"
 #include "loganalyzer/inverted_index.hpp"
@@ -75,15 +78,21 @@ Usage:
         name=NAME,threshold=N,window=60s[,service=S][,level=ERROR][,cooldown=5m][,per-service=true]
       Fires when >= N matching entries fall inside the window; cooldown suppresses repeats.
       A rules file holds one SPEC per line; lines starting with '#' are comments.
+  loganalyzer alerts FILE... --rule SPEC --follow [--from-end] [--poll-ms N] [--max-seconds N] [--max-alerts N]
+      Live mode: keep watching the files (they may not exist yet) and print each alert the moment it
+      fires. Existing content is replayed first unless --from-end. Polls every 250 ms; --max-alerts N
+      exits after N alerts (handy in scripts), --max-seconds N after N seconds. Ctrl+C stops it.
   loganalyzer report FILE... [--out report.html] [--title T] [--top N] [--buckets N] [--rule SPEC ...] [--rules-file F]
       One self-contained HTML dashboard (no scripts, no network): summary, levels, services,
       timeline, top error signatures and, with rules, the alerts they fire. Stdout without --out.
   loganalyzer serve FILE... [--port 8080] [--bind 127.0.0.1] [--title T] [--rule SPEC ...] [--rules-file F]
-                            [--allow-host NAME ...] [--max-requests N]
-      Live dashboard over HTTP: the HTML report at / and a JSON API (/api/summary, /api/top-errors,
+                            [--allow-host NAME ...] [--max-requests N] [--follow [--refresh-ms N]]
+      Dashboard over HTTP: the HTML report at / and a JSON API (/api/summary, /api/top-errors,
       /api/search?q=, /api/complete?prefix=, /api/alerts, /healthz). Loopback only by default; the
       Host header is checked (DNS-rebinding defence). --port 0 picks a free port; --max-requests
-      stops after N requests (for scripts). Press Ctrl+C to stop.
+      stops after N requests (for scripts). With --follow the dashboard keeps up with growing log
+      files: a request arriving more than --refresh-ms (default 1000) after the last look reads
+      what was appended and rebuilds the snapshot. Press Ctrl+C to stop.
   loganalyzer grep PATTERN FILE... [--ignore-case] [--level LEVEL] [--service NAME] [--max N] [--count]
       Entries whose message contains PATTERN (KMP substring search); --level is a minimum.
   loganalyzer search QUERY FILE... [--limit N] [--count]
@@ -94,13 +103,57 @@ Usage:
       Most frequent completions of a prefix (trie autocomplete). Default field: signature.
   loganalyzer bench [--count N]
       Time every stage on N generated entries in total (default 1000000).
-  loganalyzer help
+  loganalyzer help | --version
 
 FILE arguments may contain * and ? in the file name (logs/*.log); matches are sorted by name.
 
 Log line format:
   2026-10-10T12:00:00.123Z ERROR payment-service Timeout calling bank gateway after 3000ms
 )";
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown (Ctrl+C) for the long-running commands
+// ---------------------------------------------------------------------------
+
+// Set from a signal handler and from request_shutdown(), so it must be a lock-free atomic.
+std::atomic<bool> g_shutdown_requested{false};
+static_assert(std::atomic<bool>::is_always_lock_free, "a signal handler may only touch lock-free atomics");
+
+void handle_interrupt(int) { g_shutdown_requested.store(true); }
+
+bool shutdown_requested() { return g_shutdown_requested.load(); }
+
+/// Makes Ctrl+C ask the running command to finish (so it can print its summary) instead of
+/// killing the process, and restores the previous handler afterwards. Constructing it also
+/// clears an earlier request: a stop requested before the command started is stale. Construct it
+/// BEFORE announcing that the command is running, so anyone who reacts to the announcement
+/// (a test calling request_shutdown(), a user pressing Ctrl+C) is never ignored.
+class InterruptScope {
+public:
+    InterruptScope() {
+        g_shutdown_requested.store(false);
+        previous_ = std::signal(SIGINT, handle_interrupt);
+    }
+    ~InterruptScope() {
+        if (previous_ != SIG_ERR) std::signal(SIGINT, previous_);
+    }
+    InterruptScope(const InterruptScope&) = delete;
+    InterruptScope& operator=(const InterruptScope&) = delete;
+
+private:
+    using Handler = void (*)(int);
+    Handler previous_ = SIG_ERR;
+};
+
+/// Sleeps up to `millis`, returning early when a shutdown is requested.
+void sleep_unless_shutdown(std::uint64_t millis) {
+    constexpr std::uint64_t kSlice = 20;
+    while (millis > 0 && !shutdown_requested()) {
+        const std::uint64_t step = millis < kSlice ? millis : kSlice;
+        std::this_thread::sleep_for(std::chrono::milliseconds(step));
+        millis -= step;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -563,11 +616,8 @@ void load_rules_file(const std::string& path, AlertEngine& engine) {
     }
 }
 
-int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
-    const ParsedArgs parsed = parse_args(args, {"--rules-file"}, {"--rule"});
-    if (parsed.positional.empty()) throw UsageError("alerts needs at least one FILE");
-    const std::vector<std::string> files = expand_inputs(parsed.positional);
-
+/// Builds an AlertEngine from the repeatable --rule options and an optional --rules-file.
+AlertEngine alert_engine_from(const ParsedArgs& parsed) {
     AlertEngine engine;
     for (const std::string& spec : parsed.all("--rule")) {
         try {
@@ -577,7 +627,101 @@ int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ost
         }
     }
     if (parsed.has("--rules-file")) load_rules_file(parsed.options.at("--rules-file"), engine);
+    return engine;
+}
+
+/// One alert as a line of output.
+void write_alert(std::ostream& out, const Alert& a) {
+    out << format_iso8601_utc(a.fired_at_ms) << " ALERT rule=" << a.rule << " service=" << a.service
+        << " count=" << a.count << " since=" << format_iso8601_utc(a.first_event_ms)
+        << " suppressed=" << a.suppressed << "\n";
+}
+
+bool timestamp_less(const LogEntry& a, const LogEntry& b) { return a.timestamp_ms < b.timestamp_ms; }
+
+/// alerts --follow: keeps polling the files and prints each alert the moment it fires.
+///
+/// Live input has no global order (files grow independently), so each poll's batch is sorted by
+/// timestamp and replayed in that order; an entry older than what its window has already seen is
+/// counted as late by the engine, not mis-ordered.
+int alerts_follow(const std::vector<std::string>& files, AlertEngine& engine, bool from_end, std::uint64_t poll_ms,
+                  std::uint64_t max_seconds, std::uint64_t max_alerts, std::ostream& out, std::ostream& err) {
+    FollowerOptions follower_options;
+    follower_options.from_start = !from_end;
+    // Nothing accumulates here, so keep each poll small: its entries are held in memory at once
+    // (a log of tiny lines becomes about nine times as many bytes of LogEntry objects).
+    follower_options.max_bytes_per_poll = 1 << 20;
+    FileFollower follower(files, follower_options);
+    // With --from-end the first poll only records where each file ends (it returns nothing).
+    // Do it BEFORE announcing that we are following: whatever is appended after the
+    // announcement must be seen, never mistaken for content that was already there.
+    if (from_end) (void)follower.poll();
+
+    InterruptScope interrupt;  // before the announcement below: see InterruptScope
+    err << "following " << files.size() << (files.size() == 1 ? " file" : " files") << " with " << engine.rule_count()
+        << (engine.rule_count() == 1 ? " rule" : " rules") << " (press Ctrl+C to stop)" << std::endl;
+
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point started = Clock::now();
+    std::uint64_t entries = 0;
+    std::uint64_t alerts = 0;
+    bool finished = false;
+    while (!finished && !shutdown_requested()) {
+        do {
+            std::vector<LogEntry> batch = follower.poll();
+            std::stable_sort(batch.begin(), batch.end(), timestamp_less);
+            for (const LogEntry& entry : batch) {
+                ++entries;
+                for (const Alert& a : engine.process(entry)) {
+                    write_alert(out, a);
+                    out.flush();  // an alert is only useful if the reader sees it now
+                    if (!out) throw std::runtime_error("write failed");
+                    ++alerts;
+                    if (max_alerts != 0 && alerts >= max_alerts) finished = true;
+                }
+                if ((entries & 0xFFF) == 0) engine.expire_idle(entry.timestamp_ms);
+                if (finished) break;
+            }
+        } while (!finished && follower.backlog() && !shutdown_requested());
+        if (finished) break;
+        if (max_seconds != 0 &&
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started).count()) >=
+                max_seconds) {
+            break;
+        }
+        sleep_unless_shutdown(poll_ms);
+    }
+
+    const FollowStats& stats = follower.stats();
+    err << "processed " << entries << " entries with " << engine.rule_count() << " rules: " << alerts << " alerts ("
+        << stats.malformed << " malformed lines skipped, " << engine.late_events() << " late entries ignored, "
+        << stats.rotations << " file rotations seen";
+    if (engine.unreported_suppressed() != 0) {
+        err << ", " << engine.unreported_suppressed() << " suppressed crossings after the last alert";
+    }
+    err << ")\n";
+    return kOk;
+}
+
+int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    const ParsedArgs parsed = parse_args(args, {"--rules-file", "--poll-ms", "--max-seconds", "--max-alerts"},
+                                         {"--rule"}, {"--follow", "--from-end"});
+    if (parsed.positional.empty()) throw UsageError("alerts needs at least one FILE");
+    const bool follow = parsed.flag("--follow");
+    if (!follow && (parsed.flag("--from-end") || parsed.has("--poll-ms") || parsed.has("--max-seconds") ||
+                    parsed.has("--max-alerts"))) {
+        throw UsageError("--from-end, --poll-ms, --max-seconds and --max-alerts only make sense with --follow");
+    }
+    const std::vector<std::string> files = expand_inputs(parsed.positional);
+
+    AlertEngine engine = alert_engine_from(parsed);
     if (engine.rule_count() == 0) throw UsageError("alerts needs at least one --rule or --rules-file");
+
+    if (follow) {
+        return alerts_follow(files, engine, parsed.flag("--from-end"), uint_option(parsed, "--poll-ms", 250, 10, 60'000),
+                             uint_option(parsed, "--max-seconds", 0, 1, 31'536'000),
+                             uint_option(parsed, "--max-alerts", 0, 1, 1'000'000'000), out, err);
+    }
 
     std::size_t malformed = 0;
     std::vector<std::vector<LogEntry>> sources;
@@ -596,9 +740,7 @@ int cmd_alerts(const std::vector<std::string>& args, std::ostream& out, std::ost
         ++entries;
         for (const Alert& a : engine.process(entry)) {
             ++alerts;
-            out << format_iso8601_utc(a.fired_at_ms) << " ALERT rule=" << a.rule << " service=" << a.service
-                << " count=" << a.count << " since=" << format_iso8601_utc(a.first_event_ms)
-                << " suppressed=" << a.suppressed << "\n";
+            write_alert(out, a);
         }
         // Keep memory proportional to the services active in the last window, not to every
         // service ever seen (the merged stream is time-ordered, as expire_idle requires).
@@ -766,20 +908,6 @@ int cmd_complete(const std::vector<std::string>& args, std::ostream& out, std::o
     return kOk;
 }
 
-/// Builds an AlertEngine from the repeatable --rule options and an optional --rules-file.
-AlertEngine alert_engine_from(const ParsedArgs& parsed) {
-    AlertEngine engine;
-    for (const std::string& spec : parsed.all("--rule")) {
-        try {
-            engine.add_rule(parse_rule_spec(spec));
-        } catch (const std::invalid_argument& e) {
-            throw UsageError("bad --rule '" + spec + "': " + e.what());
-        }
-    }
-    if (parsed.has("--rules-file")) load_rules_file(parsed.options.at("--rules-file"), engine);
-    return engine;
-}
-
 /// Everything `report` and `serve` need from the input files: the entries, and the alerts the
 /// rules fire on them.
 struct LoadedLogs {
@@ -856,11 +984,82 @@ int cmd_report(const std::vector<std::string>& args, std::ostream& out, std::ost
 /// "127.x.y.z": the whole 127.0.0.0/8 block is loopback.
 bool is_loopback_address(const std::string& address) { return address.compare(0, 4, "127.") == 0; }
 
+/// serve --follow: a dashboard that keeps up with growing log files.
+///
+/// DashboardService is an immutable snapshot (its indexes and the rendered page are built once).
+/// To stay live, a request that arrives after `refresh` has passed since the last look polls the
+/// FileFollower and, if anything new came in, replays it through the alert engine and swaps in a
+/// freshly built service before answering. The HttpServer calls the handler from one thread at a
+/// time, so no locking is needed; a refresh costs O(entries) and delays only the request that
+/// triggered it. Without traffic nothing is read.
+class LiveDashboard {
+public:
+    LiveDashboard(const std::vector<std::string>& files, AlertEngine engine, ServeOptions options,
+                  std::chrono::milliseconds refresh)
+        : follower_(files), engine_(std::move(engine)), options_(std::move(options)), refresh_(refresh) {
+        // Everything already in the files (the static `serve` loads all of it too), then keep
+        // following from there.
+        ingest(std::numeric_limits<std::size_t>::max());
+        rebuild();
+        last_check_ = Clock::now();
+    }
+
+    HttpResponse handle(const HttpRequest& request) {
+        refresh_if_due();
+        return service_->handle(request);
+    }
+
+    std::size_t entry_count() const { return entries_.size(); }
+    std::uint64_t malformed() const { return follower_.stats().malformed; }
+
+private:
+    using Clock = std::chrono::steady_clock;
+
+    /// Reads whatever is new, at most `max_rounds` polls' worth (so one huge backlog cannot stall a
+    /// request for ever; the rest is picked up by the next refresh). True if any entry arrived.
+    bool ingest(std::size_t max_rounds) {
+        bool any = false;
+        for (std::size_t round = 0; round < max_rounds; ++round) {
+            std::vector<LogEntry> batch = follower_.poll();
+            std::stable_sort(batch.begin(), batch.end(), timestamp_less);
+            for (LogEntry& entry : batch) {
+                for (Alert& alert : engine_.process(entry)) alerts_.push_back(std::move(alert));
+                entries_.push_back(std::move(entry));
+                any = true;
+                if ((entries_.size() & 0xFFF) == 0) engine_.expire_idle(entries_.back().timestamp_ms);
+            }
+            if (!follower_.backlog()) break;
+        }
+        return any;
+    }
+
+    void rebuild() { service_ = std::make_shared<DashboardService>(entries_, alerts_, options_); }
+
+    void refresh_if_due() {
+        const Clock::time_point now = Clock::now();
+        if (now - last_check_ < refresh_) return;
+        last_check_ = now;
+        if (ingest(64)) rebuild();  // the old service keeps answering if building the new one throws
+    }
+
+    FileFollower follower_;
+    AlertEngine engine_;
+    ServeOptions options_;
+    std::chrono::milliseconds refresh_;
+    std::vector<LogEntry> entries_;
+    std::vector<Alert> alerts_;
+    std::shared_ptr<DashboardService> service_;
+    Clock::time_point last_check_;
+};
+
 int cmd_serve(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
     const ParsedArgs parsed = parse_args(
-        args, {"--port", "--bind", "--title", "--top", "--buckets", "--rules-file", "--max-requests"},
-        {"--rule", "--allow-host"});
+        args, {"--port", "--bind", "--title", "--top", "--buckets", "--rules-file", "--max-requests", "--refresh-ms"},
+        {"--rule", "--allow-host"}, {"--follow"});
     if (parsed.positional.empty()) throw UsageError("serve needs at least one FILE");
+    const bool follow = parsed.flag("--follow");
+    if (!follow && parsed.has("--refresh-ms")) throw UsageError("--refresh-ms only makes sense with --follow");
+    const std::uint64_t refresh_ms = uint_option(parsed, "--refresh-ms", 1000, 50, 3'600'000);
     const std::vector<std::string> files = expand_inputs(parsed.positional);
 
     ServeOptions options;
@@ -885,11 +1084,23 @@ int cmd_serve(const std::vector<std::string>& args, std::ostream& out, std::ostr
     server_options.allowed_hosts = hosts;
 
     AlertEngine engine = alert_engine_from(parsed);
-    LoadedLogs logs = load_logs(files, engine);
-    const std::size_t entry_count = logs.entries.size();
-    const std::size_t malformed = logs.malformed;
-    // DashboardService is move-only; the handler (a std::function) must be copyable.
-    auto service = std::make_shared<DashboardService>(std::move(logs.entries), std::move(logs.alerts), options);
+    HttpHandler handler;
+    std::size_t entry_count = 0;
+    std::uint64_t malformed = 0;
+    if (follow) {
+        auto live = std::make_shared<LiveDashboard>(files, std::move(engine), options,
+                                                    std::chrono::milliseconds(static_cast<std::int64_t>(refresh_ms)));
+        entry_count = live->entry_count();
+        malformed = live->malformed();
+        handler = [live](const HttpRequest& request) { return live->handle(request); };
+    } else {
+        LoadedLogs logs = load_logs(files, engine);
+        entry_count = logs.entries.size();
+        malformed = logs.malformed;
+        // DashboardService is move-only; the handler (a std::function) must be copyable.
+        auto service = std::make_shared<DashboardService>(std::move(logs.entries), std::move(logs.alerts), options);
+        handler = [service](const HttpRequest& request) { return service->handle(request); };
+    }
 
     std::unique_ptr<HttpServer> server;
     try {
@@ -897,10 +1108,15 @@ int cmd_serve(const std::vector<std::string>& args, std::ostream& out, std::ostr
     } catch (const std::invalid_argument& e) {
         throw UsageError(e.what());
     }
-    server->start([service](const HttpRequest& request) { return service->handle(request); });
+    server->start(std::move(handler));
 
+    InterruptScope interrupt;  // before the announcement below: see InterruptScope
     out << "serving " << entry_count << " entries on http://" << server_options.bind_address << ":" << server->port()
         << "/ (press Ctrl+C to stop)" << std::endl;
+    if (follow) {
+        err << "following " << files.size() << (files.size() == 1 ? " file" : " files")
+            << ", refreshing at most every " << refresh_ms << " ms when requests arrive\n";
+    }
     if (server_options.allowed_hosts.empty()) {
         err << "warning: bound to " << server_options.bind_address
             << " without Host header checking; pass --allow-host NAME (repeatable) to answer only the names "
@@ -908,7 +1124,8 @@ int cmd_serve(const std::vector<std::string>& args, std::ostream& out, std::ostr
     }
     if (malformed != 0) err << malformed << " malformed lines skipped\n";
 
-    while (server->running() && (max_requests == 0 || server->requests_served() < max_requests)) {
+    while (server->running() && !shutdown_requested() &&
+           (max_requests == 0 || server->requests_served() < max_requests)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     server->stop();
@@ -1123,6 +1340,10 @@ int cmd_bench(const std::vector<std::string>& args, std::ostream& out) {
 
 }  // namespace
 
+void request_shutdown() noexcept { g_shutdown_requested.store(true); }
+
+const char* version_string() noexcept { return "1.0.0"; }
+
 int run_cli(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
     try {
         if (args.empty()) {
@@ -1132,6 +1353,10 @@ int run_cli(const std::vector<std::string>& args, std::ostream& out, std::ostrea
         const std::string& command = args[0];
         if (command == "help" || command == "--help" || command == "-h") {
             out << kHelpText;
+            return kOk;
+        }
+        if (command == "version" || command == "--version" || command == "-V") {
+            out << "loganalyzer " << version_string() << "\n";
             return kOk;
         }
         if (command == "generate") return cmd_generate(args, out);

@@ -1,6 +1,9 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -1105,4 +1108,193 @@ TEST(Cli, ServeUsageAndStartupErrors) {
     CHECK_EQ(run({"serve", dir.file("missing.log")}).code, 1);
     Result bad_bind = run({"serve", f, "--bind", "not-an-ip"});
     CHECK(bad_bind.err.find("bind_address") != std::string::npos);
+}
+
+// ---- live mode: alerts --follow, serve --follow, --version ------------------------------------
+
+namespace {
+
+void append_text(const std::string& path, const std::string& text) {
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    out << text;
+}
+
+std::string error_lines(int first_ms, int count) {
+    std::string text;
+    for (int i = 0; i < count; ++i) {
+        char stamp[16];
+        std::snprintf(stamp, sizeof stamp, "%03d", (first_ms + i) % 1000);
+        text += "2026-10-10T00:00:00." + std::string(stamp) + "Z ERROR svc boom\n";
+    }
+    return text;
+}
+
+/// Waits (polling, never asserting on elapsed time) until `text()` contains `needle`. If it does
+/// not show up within the bound, asks the running command to stop so the test can fail
+/// instead of hanging.
+template <class TextFn>
+bool wait_for_text(TextFn text, const std::string& needle) {
+    for (int attempt = 0; attempt < 800; ++attempt) {  // up to ~20 s, only reached when something is broken
+        if (text().find(needle) != std::string::npos) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    loganalyzer::request_shutdown();
+    return false;
+}
+
+/// Runs `run_cli(args)` on a thread and exposes its output while it runs.
+struct RunningCommand {
+    SharedSink out_sink, err_sink;
+    std::ostream out{&out_sink};
+    std::ostream err{&err_sink};
+    std::atomic<bool> done{false};
+    int code = -1;
+    std::thread thread;
+
+    explicit RunningCommand(std::vector<std::string> args) {
+        thread = std::thread([this, args = std::move(args)] {
+            code = run_cli(args, out, err);
+            done = true;
+        });
+    }
+    ~RunningCommand() {
+        if (thread.joinable()) {
+            loganalyzer::request_shutdown();  // never leave a command running behind a failed test
+            thread.join();
+        }
+    }
+    void join() { thread.join(); }
+    std::string out_text() const { return out_sink.text(); }
+    std::string err_text() const { return err_sink.text(); }
+};
+
+}  // namespace
+
+TEST(Cli, VersionIsPrinted) {
+    Result r = run({"--version"});
+    CHECK_EQ(r.code, 0);
+    CHECK_EQ(r.out, std::string("loganalyzer ") + loganalyzer::version_string() + "\n");
+    CHECK_EQ(run({"version"}).out, r.out);
+    CHECK_EQ(run({"-V"}).out, r.out);
+}
+
+TEST(Cli, AlertsFollowFiresAsLinesArriveEvenForAFileThatDoesNotExistYet) {
+    TempDir dir("follow_alert");
+    const std::string log = dir.file("live.log");  // not created yet
+    RunningCommand cmd({"alerts", log, "--rule", "name=burst,threshold=3,window=10s", "--follow", "--poll-ms", "10",
+                        "--max-alerts", "1", "--max-seconds", "120"});
+    CHECK(wait_for_text([&] { return cmd.err_text(); }, "following 1 file"));
+
+    append_text(log, error_lines(0, 2));  // two errors: below the threshold of three
+    append_text(log, error_lines(2, 1));  // the third one fires the rule
+    CHECK(wait_for_text([&] { return cmd.out_text(); }, "ALERT rule=burst"));
+    cmd.join();
+
+    CHECK_EQ(cmd.code, 0);
+    CHECK(cmd.out_text().find("count=3") != std::string::npos);
+    CHECK(cmd.err_text().find("processed 3 entries with 1 rules: 1 alerts") != std::string::npos);
+}
+
+TEST(Cli, AlertsFollowReplaysExistingContentFirstAndThenExitsAtMaxAlerts) {
+    TempDir dir("follow_replay");
+    const std::string log = dir.file("a.log");
+    write_text(log, error_lines(0, 3));
+    RunningCommand cmd({"alerts", log, "--rule", "name=burst,threshold=3,window=10s", "--follow", "--max-alerts", "1"});
+    cmd.join();  // the alert comes from what is already in the file: no append needed
+    CHECK_EQ(cmd.code, 0);
+    CHECK(cmd.out_text().find("ALERT rule=burst") != std::string::npos);
+    CHECK(cmd.err_text().find("processed 3 entries") != std::string::npos);
+}
+
+TEST(Cli, AlertsFollowFromEndIgnoresWhatIsAlreadyThere) {
+    TempDir dir("follow_from_end");
+    const std::string log = dir.file("a.log");
+    write_text(log, error_lines(0, 5));  // would fire the rule if it were replayed
+    RunningCommand cmd({"alerts", log, "--rule", "name=burst,threshold=3,window=10s", "--follow", "--from-end", "--poll-ms",
+                        "10", "--max-alerts", "1", "--max-seconds", "120"});
+    CHECK(wait_for_text([&] { return cmd.err_text(); }, "following 1 file"));
+    CHECK(cmd.out_text().empty());
+
+    append_text(log, error_lines(10, 3));
+    CHECK(wait_for_text([&] { return cmd.out_text(); }, "ALERT rule=burst"));
+    cmd.join();
+    CHECK_EQ(cmd.code, 0);
+    CHECK(cmd.err_text().find("processed 3 entries") != std::string::npos);  // the five old ones were skipped
+}
+
+TEST(Cli, AlertsFollowStopsWhenShutdownIsRequestedAndStillReportsASummary) {
+    TempDir dir("follow_shutdown");
+    const std::string log = dir.file("quiet.log");
+    write_text(log, "2026-10-10T00:00:00.000Z INFO svc fine\n");
+    RunningCommand cmd({"alerts", log, "--rule", "name=never,threshold=100,window=1s", "--follow", "--poll-ms", "10"});
+    CHECK(wait_for_text([&] { return cmd.err_text(); }, "following 1 file"));
+    loganalyzer::request_shutdown();  // what Ctrl+C does
+    cmd.join();
+    CHECK_EQ(cmd.code, 0);
+    CHECK(cmd.err_text().find("processed 1 entries with 1 rules: 0 alerts") != std::string::npos);
+}
+
+TEST(Cli, AlertsFollowMaxSecondsEndsTheRun) {
+    TempDir dir("follow_max_seconds");
+    const std::string log = dir.file("quiet.log");
+    write_text(log, "2026-10-10T00:00:00.000Z INFO svc fine\n");
+    RunningCommand cmd({"alerts", log, "--rule", "name=never,threshold=100,window=1s", "--follow", "--poll-ms", "10",
+                        "--max-seconds", "1"});
+    CHECK(wait_for_text([&] { return cmd.err_text(); }, "processed 1 entries"));  // it stopped by itself
+    cmd.join();
+    CHECK_EQ(cmd.code, 0);
+}
+
+TEST(Cli, FollowOptionsAreValidated) {
+    TempDir dir("follow_usage");
+    write_text(dir.file("a.log"), kSearchLog);
+    const std::string f = dir.file("a.log");
+    const std::string rule = "name=x,threshold=1,window=1s";
+    CHECK_EQ(run({"alerts", f, "--rule", rule, "--from-end"}).code, 2);              // needs --follow
+    CHECK_EQ(run({"alerts", f, "--rule", rule, "--poll-ms", "50"}).code, 2);
+    CHECK_EQ(run({"alerts", f, "--rule", rule, "--max-seconds", "5"}).code, 2);
+    CHECK_EQ(run({"alerts", f, "--rule", rule, "--max-alerts", "5"}).code, 2);
+    CHECK_EQ(run({"alerts", f, "--rule", rule, "--follow", "--poll-ms", "5"}).code, 2);   // below 10 ms
+    CHECK_EQ(run({"alerts", f, "--rule", rule, "--follow", "--max-alerts", "0"}).code, 2);
+    CHECK_EQ(run({"alerts", f, "--follow"}).code, 2);                                // no rule
+    CHECK_EQ(run({"serve", f, "--refresh-ms", "100"}).code, 2);                      // needs --follow
+    CHECK_EQ(run({"serve", f, "--follow", "--refresh-ms", "10"}).code, 2);           // below 50 ms
+}
+
+TEST(Cli, ServeFollowShowsLinesAppendedAfterTheServerStarted) {
+    TempDir dir("serve_follow");
+    const std::string log = dir.file("live.log");
+    write_text(log, error_lines(0, 5));
+    RunningCommand cmd({"serve", log, "--follow", "--refresh-ms", "50", "--port", "0"});
+
+    std::uint16_t port = 0;
+    CHECK(wait_for_text([&] { return cmd.out_text(); }, "http://127.0.0.1:"));
+    {
+        const std::string text = cmd.out_text();
+        const std::string marker = "http://127.0.0.1:";
+        const std::size_t at = text.find(marker);
+        port = static_cast<std::uint16_t>(std::stoul(text.substr(at + marker.size())));
+    }
+    CHECK(cmd.out_text().find("serving 5 entries") != std::string::npos);
+    CHECK(cmd.err_text().find("following 1 file") != std::string::npos);
+
+    const std::string host = "127.0.0.1:" + std::to_string(port);
+    CHECK(http_exchange(port, get_request("/api/summary", host)).find("\"entries\":5,") != std::string::npos);
+
+    append_text(log, error_lines(10, 3));
+    bool saw_new_data = false;
+    for (int attempt = 0; attempt < 400 && !saw_new_data; ++attempt) {  // each request may trigger a refresh
+        saw_new_data = http_exchange(port, get_request("/api/summary", host)).find("\"entries\":8,") != std::string::npos;
+        if (!saw_new_data) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    CHECK(saw_new_data);
+
+    // The search index was rebuilt too: the three new lines are findable.
+    const std::string search = http_exchange(port, get_request("/api/search?q=boom&limit=50", host));
+    CHECK(search.find("\"matches\":8,") != std::string::npos);
+
+    loganalyzer::request_shutdown();
+    cmd.join();
+    CHECK_EQ(cmd.code, 0);
+    CHECK(cmd.err_text().find("served ") != std::string::npos);
 }
