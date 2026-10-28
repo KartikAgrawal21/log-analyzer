@@ -26,93 +26,17 @@
 #include <utility>
 #include <vector>
 
+#include "alloc_probe.hpp"
 #include "loganalyzer/kmp.hpp"
 #include "testkit.hpp"
 
 using loganalyzer::KmpMatcher;
 
-// ---------------------------------------------------------------------------------------------
-// Allocation probe. The matcher takes no allocator, so exception safety and allocation counts
-// can only be observed by wrapping the global operator new. It forwards to malloc and is inert
-// (one thread-local counter bump per allocation) unless a test arms it, so it is harmless to
-// every other test that shares this executable.
-//
-// Maintenance note: a program has exactly one global operator new, and CMake links every
-// tests/*.cpp into one executable, so no other test file may define it (that is a duplicate
-// symbol at link time, by design: two probes would silently fight). A second module that wants
-// allocation counting should move this probe into a shared test header instead of copying it.
-//
-// The counters are thread_local: only allocations made by the thread that reads them are
-// counted or failed, so a background thread (the thread tests below start some) can neither
-// perturb a measurement nor receive an injected std::bad_alloc. Constant-initialised
-// thread_locals need no guard, which makes them safe to touch from operator new at any time.
-
-namespace {
-
-namespace alloc_probe {
-
-// >= 0: that many further allocations succeed, then every allocation (of this thread) throws
-// std::bad_alloc.
-thread_local long succeed_before_failing = -1;
-thread_local std::size_t allocations = 0;  // total calls to operator new on this thread so far
-
-// Arms the failure injection for the lifetime of the object; always disarms, even on throw.
-struct FailAfter {
-    explicit FailAfter(long successes) { succeed_before_failing = successes; }
-    ~FailAfter() { succeed_before_failing = -1; }
-    FailAfter(const FailAfter&) = delete;
-    FailAfter& operator=(const FailAfter&) = delete;
-};
-
-}  // namespace alloc_probe
-
-}  // namespace
-
-void* operator new(std::size_t size) {
-    ++alloc_probe::allocations;
-    if (alloc_probe::succeed_before_failing == 0) throw std::bad_alloc();
-    if (alloc_probe::succeed_before_failing > 0) --alloc_probe::succeed_before_failing;
-    if (void* p = std::malloc(size == 0 ? 1 : size)) return p;
-    throw std::bad_alloc();
-}
-
-// malloc / free is a correct pair here, but once GCC inlines these it pairs the replaced
-// operator new with them and reports the free() as a mismatched deallocation.
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-#endif
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-
-// The complete family, not just the two above. Replacing only some leaves the others on the
-// library's own allocator, and memory from one family is then freed by the other: under
-// AddressSanitizer std::stable_sort's temporary buffer (operator new(size, nothrow), served by
-// ASan) reached the free() above and aborted the run as an alloc-dealloc mismatch. Every
-// variant counts, honours the failure injection, and pairs malloc with free. (Over-aligned
-// variants are not replaced: nothing in these tests allocates over-aligned types.)
-void* operator new[](std::size_t size) { return operator new(size); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    try {
-        return operator new(size);
-    } catch (...) {
-        return nullptr;
-    }
-}
-void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
-    try {
-        return operator new(size);
-    } catch (...) {
-        return nullptr;
-    }
-}
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
-void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
+// The allocation probe (counting, and failing the Nth allocation) is shared with the other tests:
+// see alloc_probe.hpp. The matcher takes no allocator, so exception safety and allocation counts
+// can only be observed by wrapping the global operator new. The counters are thread_local, so a
+// background thread (the thread tests below start some) can neither perturb a measurement nor
+// receive an injected std::bad_alloc.
 
 namespace {
 
