@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (GCC, Release)
+            os: ubuntu-latest
+            config: Release
+            extra: ""
+          - name: Linux (GCC, AddressSanitizer + UBSan)
+            os: ubuntu-latest
+            config: Debug
+            extra: "-DLOGANALYZER_SANITIZE=ON"
+          - name: Windows (MSVC, Release)
+            os: windows-latest
+            config: Release
+            extra: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.config }} ${{ matrix.extra }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+
+      - name: Test
+        # One test binary; it prints every failing test and exits non-zero on any failure.
+        run: ctest --test-dir build --build-config ${{ matrix.config }} --output-on-failure

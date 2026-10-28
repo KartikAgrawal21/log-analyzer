@@ -30,6 +30,10 @@ add_executable(loganalyzer_tests ${TEST_SOURCES})
 target_include_directories(loganalyzer_tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_link_libraries(loganalyzer_tests PRIVATE loganalyzer_lib)
 
+# cmake -DLOGANALYZER_SANITIZE=ON builds everything with AddressSanitizer and
+# UndefinedBehaviorSanitizer (GCC / Clang; on MSVC use tools/quick.ps1 -Asan instead).
+option(LOGANALYZER_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer (GCC/Clang)" OFF)
+
 foreach(tgt loganalyzer_lib loganalyzer loganalyzer_tests)
   if(MSVC)
     # C4127 fires on the do { } while (0) idiom inside the test macros.
@@ -37,6 +41,10 @@ foreach(tgt loganalyzer_lib loganalyzer loganalyzer_tests)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)
   else()
     target_compile_options(${tgt} PRIVATE -Wall -Wextra -Wpedantic)
+    if(LOGANALYZER_SANITIZE)
+      target_compile_options(${tgt} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+      target_link_options(${tgt} PRIVATE -fsanitize=address,undefined)
+    endif()
   endif()
 endforeach()
 
